@@ -5,9 +5,14 @@ Cookie-based HTTP client for Perplexity AI
 
 import json
 import uuid
+import os
 from pathlib import Path
 from typing import Dict, Generator, Optional
 import httpx
+
+
+class CookieAuthError(Exception):
+    """Raised when Perplexity cookie is missing or no longer valid."""
 
 
 class PerplexityClient:
@@ -30,25 +35,28 @@ class PerplexityClient:
                 cookie_list = json.load(f)
             self.cookies = {c['name']: c['value'] for c in cookie_list}
         else:
-            raise ValueError("Must provide either cookies dict or cookies_file")
+            raise CookieAuthError(
+                "未找到可用 cookie。请打开浏览器登录 Perplexity 后重新导出 cookies.json。"
+            )
         
         # Create HTTP client
+        user_agent = os.getenv(
+            "PPLX_USER_AGENT",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/144.0.0.0 Safari/537.36",
+        )
+        headers = {
+            "User-Agent": user_agent,
+            "Accept": "text/event-stream",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/json",
+            "Origin": "https://www.perplexity.ai",
+            "Referer": "https://www.perplexity.ai/",
+        }
         self.client = httpx.Client(
             cookies=self.cookies,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-                'Accept': 'text/event-stream',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Content-Type': 'application/json',
-                'Origin': 'https://www.perplexity.ai',
-                'Referer': 'https://www.perplexity.ai/',
-                'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144"',
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Linux"',
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-            },
+            headers=headers,
             timeout=60.0,
             follow_redirects=True
         )
@@ -65,42 +73,37 @@ class PerplexityClient:
         Yields:
             Response chunks as dictionaries
         """
-        # Generate UUIDs
-        frontend_uuid = str(uuid.uuid4())
-        backend_uuid = str(uuid.uuid4())
-        read_write_token = str(uuid.uuid4())
-        
-        # Build request payload
+        # Build payload matching current web client shape.
         payload = {
-            "params": {
-                "last_backend_uuid": backend_uuid,
-                "read_write_token": read_write_token,
-                "attachments": [],
-                "language": "en-US",
-                "timezone": "America/New_York",
-                "search_focus": "internet",
-                "sources": ["web"],
-                "frontend_uuid": frontend_uuid,
-                "mode": "copilot",
-                "model_preference": model,
-                "is_related_query": False,
-                "is_sponsored": False,
-                "prompt_source": "user",
-                "query_source": "default",
-                "is_incognito": False,
-                "use_schematized_api": True,
-                "send_back_text_in_streaming_api": False,
-                "supported_block_use_cases": [
-                    "answer_modes", "media_items", "knowledge_cards",
-                    "inline_entity_cards", "search_result_widgets"
-                ],
-                "version": "2.18"
-            },
-            "query_str": query
+            "version": "2.18",
+            "source": "default",
+            "frontend_uuid": str(uuid.uuid4()),
+            "language": "en-US",
+            "timezone": "America/New_York",
+            "search_focus": "internet",
+            "mode": "concise",
+            "is_related_query": False,
+            "is_default_related_query": False,
+            "visitor_id": "",
+            "query_str": query,
+            "base_model": model,
+            "is_vscode_extension": False,
+            "supported_block_use_cases": [
+                "answer_modes",
+                "media_items",
+                "knowledge_cards",
+                "inline_entity_cards",
+                "search_result_widgets",
+            ],
         }
         
         # Send request
         with self.client.stream('POST', self.API_URL, json=payload) as response:
+            if response.status_code in (401, 403):
+                raise CookieAuthError(
+                    "Perplexity cookie 可能已过期或失效。请打开浏览器重新登录 Perplexity，"
+                    "然后重新导出 cookies.json。"
+                )
             response.raise_for_status()
             
             # Parse SSE stream

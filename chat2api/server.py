@@ -12,7 +12,7 @@ import time
 import os
 from pathlib import Path
 
-from chat2api.providers.perplexity import PerplexityClient
+from chat2api.providers.perplexity import PerplexityClient, CookieAuthError
 
 app = FastAPI(
     title="Chat2API",
@@ -129,6 +129,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
             # Non-streaming response
             return await non_streaming_chat_completion(client, query, perplexity_model, request.model)
     
+    except CookieAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -178,6 +180,17 @@ async def stream_chat_completion(client: PerplexityClient, query: str, perplexit
         yield f"data: {json.dumps(final_chunk)}\n\n"
         yield "data: [DONE]\n\n"
     
+    except CookieAuthError as e:
+        # Stream a terminal error in SSE format so clients get a clear action hint.
+        err = {
+            "error": {
+                "message": str(e),
+                "type": "authentication_error",
+                "code": "cookie_invalid_or_missing"
+            }
+        }
+        yield f"data: {json.dumps(err, ensure_ascii=False)}\\n\\n"
+        yield "data: [DONE]\\n\\n"
     finally:
         client.close()
 
@@ -214,6 +227,8 @@ async def non_streaming_chat_completion(client: PerplexityClient, query: str, pe
             }
         }
     
+    except CookieAuthError:
+        raise
     finally:
         client.close()
 
