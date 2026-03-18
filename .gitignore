@@ -68,3 +68,6 @@ poc/websocket_traffic.json
 *.tmp
 *.temp
 .cache/
+
+# Private Documents
+DESIGN.md
