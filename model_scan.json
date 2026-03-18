@@ -1,0 +1,75 @@
+{
+  "gemini_models": {
+    "gemini-2.5-flash": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    },
+    "gemini-2.5-flash-lite": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    },
+    "gemini-2.5-pro": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    },
+    "gemini-3-flash-preview": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    },
+    "gemini-3-pro-preview": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    },
+    "gemini-3.1-flash-lite-preview": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    },
+    "gemini-3.1-pro-preview": {
+      "percentage": 100,
+      "reset_time": "2026-03-19T21:12:46Z"
+    }
+  },
+  "codex_accounts": [
+    {
+      "email": "aken@liberty.edu",
+      "plan_type": "free",
+      "weekly_used": 71,
+      "weekly_reset": 1774130071,
+      "burst_used": "?",
+      "burst_reset": 0
+    },
+    {
+      "email": "liuyl.david@gmail.com",
+      "plan_type": "free",
+      "weekly_used": 0,
+      "weekly_reset": 1774473169,
+      "burst_used": "?",
+      "burst_reset": 0
+    },
+    {
+      "email": "swimming.crystalball@gmail.com",
+      "plan_type": "free",
+      "weekly_used": 1,
+      "weekly_reset": 1774296172,
+      "burst_used": "?",
+      "burst_reset": 0
+    },
+    {
+      "email": "carpool.london@gmail.com",
+      "plan_type": "free",
+      "weekly_used": 1,
+      "weekly_reset": 1774296507,
+      "burst_used": "?",
+      "burst_reset": 0
+    },
+    {
+      "email": "maritime2007@gmail.com",
+      "plan_type": "free",
+      "weekly_used": 0,
+      "weekly_reset": 1774473173,
+      "burst_used": "?",
+      "burst_reset": 0
+    }
+  ],
+  "timestamp": "2026-03-18T21:12:53.633327+00:00"
+}

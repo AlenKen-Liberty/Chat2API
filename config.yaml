@@ -1,0 +1,124 @@
+server:
+  host: "127.0.0.1"
+  port: 8000
+
+# ═══════════════════════════════════════════════════════════════
+# Provider 元数据
+# quota_group: 所有同 provider 模型共享的配额组标识（实测结论）
+# best_model:  当指定 provider 名称时，实际使用的模型 ID
+# fallback:    当本 provider 所有账号耗尽时，切到哪个 provider
+# ═══════════════════════════════════════════════════════════════
+providers:
+  gemini:
+    quota_group: "gemini-all"
+    best_model: "gemini-3.1-pro-preview"
+    fallback: "codex"
+
+  codex:
+    quota_group: "codex-weekly"
+    best_model: "gpt-5.4"
+    fallback: "gemini"
+
+# ═══════════════════════════════════════════════════════════════
+# 用户可见模型名称映射
+#
+# 用户在 model 字段填任意这里的名称即可。
+# 主要别名：
+#   "gemini" → gemini provider 的 best_model (gemini-3.1-pro-preview)
+#   "codex"  → codex  provider 的 best_model (gpt-5.4)
+#
+# 具体模型名称也可以填，路由到对应 provider，使用指定 model_id。
+# ═══════════════════════════════════════════════════════════════
+models:
+  # ── 主别名（推荐使用）──
+  gemini:
+    provider: gemini
+    model_id: "gemini-3.1-pro-preview"
+
+  codex:
+    provider: codex
+    model_id: "gpt-5.4"
+
+  # ── Gemini 完整模型列表（实测 2026-03-18，全部共享同一配额池）──
+  gemini-3.1-pro-preview:
+    provider: gemini
+    model_id: "gemini-3.1-pro-preview"
+
+  gemini-3-pro-preview:
+    provider: gemini
+    model_id: "gemini-3-pro-preview"
+
+  gemini-2.5-pro:
+    provider: gemini
+    model_id: "gemini-2.5-pro"
+
+  gemini-3-flash-preview:
+    provider: gemini
+    model_id: "gemini-3-flash-preview"
+
+  gemini-2.5-flash:
+    provider: gemini
+    model_id: "gemini-2.5-flash"
+
+  gemini-3.1-flash-lite-preview:
+    provider: gemini
+    model_id: "gemini-3.1-flash-lite-preview"
+
+  gemini-2.5-flash-lite:
+    provider: gemini
+    model_id: "gemini-2.5-flash-lite"
+
+  # ── Codex 完整模型列表（实测 2026-03-18，全部共享同一 weekly 配额池）──
+  gpt-5.4:
+    provider: codex
+    model_id: "gpt-5.4"
+
+  gpt-5.4-mini:
+    provider: codex
+    model_id: "gpt-5.4-mini"
+
+  gpt-5.3-codex:
+    provider: codex
+    model_id: "gpt-5.3-codex"
+
+  gpt-5.2-codex:
+    provider: codex
+    model_id: "gpt-5.2-codex"
+
+  gpt-5.2:
+    provider: codex
+    model_id: "gpt-5.2"
+
+  gpt-5.1-codex-max:
+    provider: codex
+    model_id: "gpt-5.1-codex-max"
+
+  gpt-5.1-codex-mini:
+    provider: codex
+    model_id: "gpt-5.1-codex-mini"
+
+  gpt-oss-120b:
+    provider: codex
+    model_id: "gpt-oss-120b"
+
+  gpt-oss-20b:
+    provider: codex
+    model_id: "gpt-oss-20b"
+
+# ═══════════════════════════════════════════════════════════════
+# 反检测配置
+# ═══════════════════════════════════════════════════════════════
+anti_detection:
+  tls_strategy: "native"       # native | node | chrome | sidecar
+  tls_impersonate:             # curl_cffi impersonate target (当 strategy=node/chrome 时生效)
+  max_rpm_per_account: 10      # 每账号每分钟最大请求数
+  single_concurrency: true     # 每账号同时只处理一个请求（单账号单 Session 原则）
+
+# ═══════════════════════════════════════════════════════════════
+# 配额管理
+# ═══════════════════════════════════════════════════════════════
+quota:
+  cache_ttl: 60                # 配额缓存秒数（避免频繁查 API）
+  safety_threshold: 40         # 低于此百分比预警
+  check_interval: 300          # 后台定期检查间隔
+  refresh_retry_interval: 600  # Token refresh 失败后重试间隔

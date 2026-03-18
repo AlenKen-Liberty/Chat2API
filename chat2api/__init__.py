@@ -1,7 +1,5 @@
-"""Chat2API - OpenAI-compatible API wrapper for AI chat interfaces"""
+"""Chat2API package."""
+
+__all__ = ["__version__"]
 
 __version__ = "0.1.0"
-
-from chat2api.providers.perplexity import PerplexityClient
-
-__all__ = ["PerplexityClient"]
