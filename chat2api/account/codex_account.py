@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -84,7 +85,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    _ensure_accounts_dir()
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
@@ -197,6 +198,78 @@ def get_preferred_account() -> CodexAccount:
             if account.email == active_email:
                 return account
     return sorted(enabled, key=lambda account: account.last_used)[0]
+
+
+def get_active_account_email() -> str | None:
+    if AUTH_PATH.exists():
+        auth_data = _read_json(AUTH_PATH)
+        tokens = auth_data.get("tokens") or {}
+        info = extract_account_info(tokens.get("id_token"), tokens.get("access_token"))
+        if info.email:
+            return info.email
+    if ACCOUNTS_INDEX_PATH.exists():
+        return (_read_json(ACCOUNTS_INDEX_PATH)).get("active_account")
+    return None
+
+
+def _upsert_index_account(email: str, *, active_email: str | None = None) -> None:
+    index = _read_json(ACCOUNTS_INDEX_PATH) if ACCOUNTS_INDEX_PATH.exists() else {"accounts": []}
+    accounts = list(index.get("accounts") or [])
+    if email not in accounts:
+        accounts.append(email)
+    index["accounts"] = accounts
+    if active_email is not None:
+        index["active_account"] = active_email
+    _atomic_write_json(ACCOUNTS_INDEX_PATH, index)
+
+
+def _snapshot_current_auth() -> None:
+    if not AUTH_PATH.exists():
+        return
+    auth_data = _read_json(AUTH_PATH)
+    tokens = auth_data.get("tokens") or {}
+    info = extract_account_info(tokens.get("id_token"), tokens.get("access_token"))
+    if not info.email:
+        return
+
+    existing = load_account(info.email) if _account_path(info.email).exists() else None
+    account = CodexAccount(
+        email=info.email,
+        access_token=tokens.get("access_token", ""),
+        refresh_token=tokens.get("refresh_token", ""),
+        id_token=tokens.get("id_token", ""),
+        account_id=tokens.get("account_id") or info.account_id or (existing.account_id if existing else ""),
+        plan_type=info.plan_type or (existing.plan_type if existing else "unknown"),
+        quota_snapshot=existing.quota_snapshot if existing else {},
+        disabled=existing.disabled if existing else False,
+        created_at=existing.created_at if existing else int(time.time()),
+        last_used=int(time.time()),
+    )
+    save_account(account)
+    _upsert_index_account(account.email)
+
+
+def set_active_account(email: str) -> CodexAccount:
+    _snapshot_current_auth()
+    accounts = {account.email: account for account in list_accounts()}
+    account = accounts.get(email)
+    if account is None:
+        raise CodexAuthError(f"Codex account '{email}' not found")
+
+    auth_data = _read_json(AUTH_PATH) if AUTH_PATH.exists() else {}
+    auth_data["auth_mode"] = auth_data.get("auth_mode") or "chatgpt"
+    auth_data["OPENAI_API_KEY"] = auth_data.get("OPENAI_API_KEY")
+    auth_data["tokens"] = {
+        "id_token": account.id_token,
+        "access_token": account.access_token,
+        "refresh_token": account.refresh_token,
+        "account_id": account.account_id,
+    }
+    auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    _atomic_write_json(AUTH_PATH, auth_data)
+    _upsert_index_account(account.email, active_email=account.email)
+    return account
 
 
 def refresh_tokens(refresh_token: str) -> dict[str, Any]:

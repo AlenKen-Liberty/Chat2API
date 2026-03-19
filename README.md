@@ -34,10 +34,18 @@ pytest tests/ -v
 
 ## Usage
 
-Start the background service (by default, it will listen on `127.0.0.1:8000`):
+Start the background service (by default, it will listen on `127.0.0.1:7860`):
 
 ```bash
-uvicorn chat2api.main:app --host 127.0.0.1 --port 8000
+uvicorn chat2api.main:app --host 127.0.0.1 --port 7860
+```
+
+To keep it running across reboots with `systemd`, install the bundled unit and enable it:
+
+```bash
+sudo cp chat2api.service /etc/systemd/system/chat2api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now chat2api.service
 ```
 
 You can now call the API using any OpenAI-compatible client, securely bridging out via your local CLI proxies.
@@ -52,6 +60,28 @@ Semantic model aliases are also available, while keeping direct model selection 
 - `codex-fast` -> `gpt-5.1-codex-mini`
 
 The original concrete model IDs still work, so experienced callers can continue selecting the exact model they want.
+
+Basic request examples:
+
+```bash
+curl http://127.0.0.1:7860/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gemini-2.5-pro",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "stream": false
+  }'
+```
+
+```bash
+curl http://127.0.0.1:7860/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "codex-thinking",
+    "messages": [{"role": "user", "content": "List three refactor ideas for this repo."}],
+    "stream": true
+  }'
+```
 
 Codex-specific compatibility notes:
 
@@ -68,8 +98,10 @@ Gemini-specific compatibility notes:
 
 The admin router now exposes browser-friendly quota pages:
 
-- `/admin/quota-urls` lists one local quota URL per configured model and per account.
+- `/admin/quota-urls` lists one local quota URL per configured model and per account, and marks which Gemini/Codex account is currently active.
 - `/admin/quota?provider=gemini&account=you@example.com&model=gemini-2.5-pro` shows live quota for that account/model.
 - `/admin/quota?provider=codex&account=you@example.com&model=gpt-5.4` shows live Codex quota. Codex quota is shared across all configured Codex models, so each model link resolves to the same account-level usage windows.
+- The dashboard can switch the active Gemini or Codex account in-place, so the next routed requests use that credential set immediately.
+- Gemini cards collapse models into shared pools when Gemini reports the same live quota bucket for multiple models, while Codex cards summarize the shared weekly window for the active account.
 
 Add `?format=json` if you want the raw JSON response instead of the HTML browser view.

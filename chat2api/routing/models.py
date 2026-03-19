@@ -9,7 +9,7 @@ router = APIRouter(prefix="/v1", tags=["models"])
 
 
 @router.get("/models")
-def list_models() -> dict:
+async def list_models() -> dict:
     model_router = get_model_router()
     return {
         "object": "list",
@@ -18,7 +18,7 @@ def list_models() -> dict:
 
 
 @router.get("/models/{model_id:path}")
-def get_model(model_id: str) -> dict:
+async def get_model(model_id: str) -> dict:
     model_router = get_model_router()
     target = model_router.get(model_id)
     if target is None:

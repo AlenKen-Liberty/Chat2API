@@ -29,7 +29,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
 
     @app.get("/")
-    def root() -> dict:
+    async def root() -> dict:
         settings = get_settings()
         return {
             "name": "Chat2API",
@@ -41,7 +41,7 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
         return {"status": "healthy"}
 
     return app

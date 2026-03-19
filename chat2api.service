@@ -1,0 +1,18 @@
+[Unit]
+Description=Chat2API service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/scripts/Chat2API
+Environment=CHAT2API_CONFIG=/home/ubuntu/scripts/Chat2API/config.yaml
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m uvicorn chat2api.main:app --host 127.0.0.1 --port 7860
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

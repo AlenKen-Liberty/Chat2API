@@ -6,17 +6,21 @@ from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from chat2api.account.codex_account import (
     CodexAuthError,
     ensure_fresh_account as ensure_fresh_codex_account,
+    get_active_account_email as get_active_codex_account_email,
     list_accounts as list_codex_accounts,
+    set_active_account as set_active_codex_account,
 )
 from chat2api.account.gemini_account import (
     GeminiAuthError,
     ensure_fresh_account as ensure_fresh_gemini_account,
+    get_active_account_email as get_active_gemini_account_email,
     list_accounts as list_gemini_accounts,
+    set_active_account as set_active_gemini_account,
 )
 from chat2api.config import get_settings
 from chat2api.quota import (
@@ -38,7 +42,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 @router.get("/health")
-def admin_health() -> dict:
+async def admin_health() -> dict:
     gemini_accounts = list_gemini_accounts()
     codex_accounts = list_codex_accounts()
     return {
@@ -57,7 +61,7 @@ def admin_health() -> dict:
 
 
 @router.get("/quota-urls", name="admin_quota_urls")
-def admin_quota_urls(request: Request):
+async def admin_quota_urls(request: Request):
     payload = {
         "providers": _build_provider_entries(request),
     }
@@ -67,7 +71,7 @@ def admin_quota_urls(request: Request):
 
 
 @router.get("/quota", name="admin_quota")
-def admin_quota(request: Request, provider: str, account: str, model: str):
+async def admin_quota(request: Request, provider: str, account: str, model: str):
     model_entry = _get_model_entry(provider, model)
 
     if provider == "gemini":
@@ -80,6 +84,19 @@ def admin_quota(request: Request, provider: str, account: str, model: str):
     if _wants_html(request):
         return HTMLResponse(_render_quota_detail_html(payload))
     return payload
+
+
+@router.post("/activate-account", name="admin_activate_account")
+async def admin_activate_account(request: Request, provider: str, account: str, next: str | None = None):
+    if provider == "gemini":
+        set_active_gemini_account(account)
+    elif provider == "codex":
+        set_active_codex_account(account)
+    else:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{provider}'")
+
+    target = next or str(request.url_for("admin_quota_urls"))
+    return RedirectResponse(target, status_code=303)
 
 
 def _wants_html(request: Request) -> bool:
@@ -133,17 +150,24 @@ def _get_model_entry(provider: str, model_id: str) -> dict[str, Any]:
 def _build_provider_entries(request: Request) -> list[dict[str, Any]]:
     settings = get_settings()
     models = _configured_models()
+    gemini_active_email = get_active_gemini_account_email()
+    codex_active_email = get_active_codex_account_email()
     return [
         {
             "provider": "gemini",
             "quota_group": settings.providers.get("gemini").quota_group if settings.providers.get("gemini") else None,
             "shared_quota": False,
             "usage_note": (
-                "Gemini is grouped by Flash, Lite, and Pro families. "
-                "Within each family, the current quota buckets share the same remaining percentage and reset time."
+                "Gemini cards group models by the live quota bucket returned by retrieveUserQuota. "
+                "When multiple models currently share the same remaining percentage and reset time, they collapse into one pool."
             ),
             "accounts": [
-                _build_gemini_account_entry(request, account, models.get("gemini", []))
+                _build_gemini_account_entry(
+                    request,
+                    account,
+                    models.get("gemini", []),
+                    active_email=gemini_active_email,
+                )
                 for account in list_gemini_accounts()
             ],
         },
@@ -158,15 +182,26 @@ def _build_provider_entries(request: Request) -> list[dict[str, Any]]:
                 "so stronger models can drain the same pool faster than mini variants."
             ),
             "accounts": [
-                _build_codex_account_entry(request, account, models.get("codex", []))
+                _build_codex_account_entry(
+                    request,
+                    account,
+                    models.get("codex", []),
+                    active_email=codex_active_email,
+                )
                 for account in list_codex_accounts()
             ],
         },
     ]
 
 
-def _build_gemini_account_entry(request: Request, account: Any, provider_models: list[dict[str, Any]]) -> dict[str, Any]:
-    entry = _base_account_entry(request, "gemini", account, provider_models, shared_quota=False)
+def _build_gemini_account_entry(
+    request: Request,
+    account: Any,
+    provider_models: list[dict[str, Any]],
+    *,
+    active_email: str | None,
+) -> dict[str, Any]:
+    entry = _base_account_entry(request, "gemini", account, provider_models, shared_quota=False, active_email=active_email)
 
     try:
         account = ensure_fresh_gemini_account(account)
@@ -217,8 +252,14 @@ def _build_gemini_account_entry(request: Request, account: Any, provider_models:
     return entry
 
 
-def _build_codex_account_entry(request: Request, account: Any, provider_models: list[dict[str, Any]]) -> dict[str, Any]:
-    entry = _base_account_entry(request, "codex", account, provider_models, shared_quota=True)
+def _build_codex_account_entry(
+    request: Request,
+    account: Any,
+    provider_models: list[dict[str, Any]],
+    *,
+    active_email: str | None,
+) -> dict[str, Any]:
+    entry = _base_account_entry(request, "codex", account, provider_models, shared_quota=True, active_email=active_email)
     if account.disabled:
         entry["disabled_reason"] = getattr(account, "disabled_reason", None)
         entry["quota_error"] = "Account is disabled"
@@ -258,6 +299,7 @@ def _base_account_entry(
     provider_models: list[dict[str, Any]],
     *,
     shared_quota: bool,
+    active_email: str | None,
 ) -> dict[str, Any]:
     quota_url = None
     if provider_models:
@@ -272,10 +314,13 @@ def _base_account_entry(
         "account_id": getattr(account, "account_id", None),
         "plan_type": getattr(account, "plan_type", None),
         "quota_url": quota_url,
+        "activate_url": _activate_account_url(request, provider=provider, account=account.email),
+        "is_active": account.email == active_email,
         "models": [
             {
                 "model_id": model["model_id"],
                 "aliases": model["aliases"],
+                "quota_group": model["quota_group"],
                 "url": _quota_url(
                     request,
                     provider=provider,
@@ -292,6 +337,18 @@ def _base_account_entry(
 def _quota_url(request: Request, provider: str, account: str, model: str) -> str:
     base = str(request.url_for("admin_quota"))
     query = urlencode({"provider": provider, "account": account, "model": model})
+    return f"{base}?{query}"
+
+
+def _activate_account_url(request: Request, provider: str, account: str) -> str:
+    base = str(request.url_for("admin_activate_account"))
+    query = urlencode(
+        {
+            "provider": provider,
+            "account": account,
+            "next": str(request.url_for("admin_quota_urls")),
+        }
+    )
     return f"{base}?{query}"
 
 
@@ -436,12 +493,12 @@ def _group_gemini_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
 
     for model in models:
-        family = _gemini_family(model["model_id"])
+        key = _gemini_group_key(model)
         group = grouped.setdefault(
-            family,
+            key,
             {
-                "key": family,
-                "label": family.title(),
+                "key": key,
+                "label": "",
                 "models": [],
                 "quota": None,
                 "mixed_quota": False,
@@ -454,29 +511,73 @@ def _group_gemini_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if model.get("quota_error") and not group.get("quota_error"):
             group["quota_error"] = model["quota_error"]
 
-        if not quota:
-            continue
-
-        current = group.get("quota")
-        if current is None:
+        if quota and group.get("quota") is None:
             group["quota"] = quota
-            continue
 
-        current_signature = (
-            current.get("remaining_percent"),
-            current.get("reset_time"),
-            current.get("reset_in"),
-        )
-        quota_signature = (
-            quota.get("remaining_percent"),
-            quota.get("reset_time"),
-            quota.get("reset_in"),
-        )
-        if current_signature != quota_signature:
-            group["mixed_quota"] = True
+    result = list(grouped.values())
+    for group in result:
+        group["label"] = _gemini_group_label(group)
 
-    order = {"flash": 0, "lite": 1, "pro": 2, "other": 3}
-    return sorted(grouped.values(), key=lambda item: (order.get(item["key"], 99), item["label"]))
+    return sorted(result, key=_gemini_group_sort_key)
+
+
+def _gemini_group_key(model: dict[str, Any]) -> str:
+    quota = model.get("quota") or {}
+    remaining = quota.get("remaining_fraction")
+    if remaining is None:
+        remaining = quota.get("remaining_percent")
+    reset_time = quota.get("reset_time")
+    if remaining is not None or reset_time:
+        return f"live:{remaining}:{reset_time or ''}"
+
+    quota_group = model.get("quota_group")
+    if quota_group:
+        return f"configured:{quota_group}"
+
+    return f"model:{model['model_id']}"
+
+
+def _gemini_group_label(group: dict[str, Any]) -> str:
+    models = group.get("models") or []
+    model_count = len(models)
+    families = sorted(
+        {
+            family
+            for family in (_gemini_family(model["model_id"]) for model in models)
+            if family != "other"
+        }
+    )
+    key = str(group.get("key") or "")
+
+    if key.startswith("configured:"):
+        quota_group = key.split(":", 1)[1]
+        base = "Shared pool" if quota_group == "gemini-all" else f"Quota pool {quota_group}"
+    elif model_count == 1:
+        base = models[0]["model_id"]
+    elif len(families) == 1:
+        base = f"{families[0].title()} pool"
+    else:
+        base = "Shared pool"
+
+    if model_count > 1:
+        return f"{base} ({model_count} models)"
+    return base
+
+
+def _gemini_group_sort_key(group: dict[str, Any]) -> tuple[int, float, str]:
+    order = {"shared": 0, "pro": 1, "flash": 2, "lite": 3, "other": 4}
+    families = {
+        _gemini_family(model["model_id"])
+        for model in group.get("models") or []
+    }
+    if len(families) == 1:
+        family = next(iter(families))
+        family_order = order.get(family, 99)
+    else:
+        family_order = order["shared"]
+    model_ids = sorted(model["model_id"] for model in group.get("models") or [])
+    first_model_id = model_ids[0] if model_ids else str(group.get("label") or "")
+    return (family_order, first_model_id)
 
 
 def _gemini_family(model_id: str) -> str:
@@ -490,6 +591,12 @@ def _gemini_family(model_id: str) -> str:
     return "other"
 
 
+def _provider_sort_key(provider: dict[str, Any]) -> tuple[int, str]:
+    order = {"codex": 0, "gemini": 1}
+    name = str(provider.get("provider") or "")
+    return (order.get(name, 99), name)
+
+
 def _render_quota_urls_html(payload: dict[str, Any]) -> str:
     sections = [
         "<!doctype html>",
@@ -500,25 +607,22 @@ def _render_quota_urls_html(payload: dict[str, Any]) -> str:
         "<header class='hero'>",
         "<div class='hero__eyebrow'>Chat2API Admin</div>",
         "<h1>Quota Dashboard</h1>",
-        "<p>Codex is summarized per account because all Codex models share the same quota pool. "
-        "Gemini is grouped by Flash, Lite, and Pro families because the returned quota buckets line up that way.</p>",
+        "<p>Main board only shows quota, reset time, active state, and account switching. "
+        "Click an account or quota block when you want the detailed view.</p>",
         "</header>",
     ]
 
-    for provider in payload["providers"]:
+    for provider in sorted(payload["providers"], key=_provider_sort_key):
         provider_name = provider["provider"]
         provider_class = f"provider--{escape(provider_name)}"
         sections.append(f"<section class='provider {provider_class}'>")
         sections.append("<div class='provider__head'>")
         sections.append(
             f"<div><div class='provider__label'>{escape(provider_name)}</div>"
-            f"<div class='provider__meta'>quota_group={escape(str(provider.get('quota_group')))} | "
-            f"shared_quota={escape(str(provider.get('shared_quota')))}</div></div>"
+            f"<div class='provider__meta'>{escape(_provider_summary(provider_name))}</div></div>"
         )
         sections.append(f"<div class='provider__count'>{len(provider.get('accounts') or [])} account(s)</div>")
         sections.append("</div>")
-        if provider.get("usage_note"):
-            sections.append(f"<p class='provider__note'>{escape(str(provider['usage_note']))}</p>")
 
         accounts = provider.get("accounts") or []
         if not accounts:
@@ -526,8 +630,8 @@ def _render_quota_urls_html(payload: dict[str, Any]) -> str:
             sections.append("</section>")
             continue
 
-        sections.append("<div class='account-grid'>")
-        for account in accounts:
+        sections.append("<div class='account-list'>")
+        for account in sorted(accounts, key=_account_sort_key):
             if provider_name == "gemini":
                 sections.append(_render_gemini_account_card(account))
             else:
@@ -542,6 +646,54 @@ def _display_value(value: Any, *, suffix: str = "") -> str:
     if value is None:
         return "N/A"
     return f"{value}{suffix}"
+
+
+def _provider_summary(provider_name: str) -> str:
+    if provider_name == "codex":
+        return "Each row shows the shared weekly Codex pool for that account."
+    if provider_name == "gemini":
+        return "Each row shows the live Gemini quota pools for that account."
+    return "Per-account quota overview."
+
+
+def _account_sort_key(account: dict[str, Any]) -> tuple[int, int, int, str]:
+    return (
+        0 if account.get("is_active") else 1,
+        0 if not account.get("quota_error") else 1,
+        0 if not account.get("disabled") else 1,
+        str(account.get("email") or ""),
+    )
+
+
+def _render_provider_overview(provider: dict[str, Any]) -> str:
+    provider_name = provider["provider"]
+    models = _configured_models().get(provider_name, [])
+    sections = ["<div class='provider-overview'>"]
+
+    if provider_name == "codex":
+        sections.append("<div class='provider-overview__label'>Available models</div>")
+        sections.append(_render_model_pills(models, tone="codex"))
+    else:
+        sections.append("<div class='provider-overview__label'>Configured quota pools</div>")
+        sections.append("<div class='catalog-grid'>")
+        grouped = _group_gemini_models(models)
+        for group in grouped:
+            sections.append("<div class='catalog-card'>")
+            sections.append(f"<div class='catalog-card__title'>{escape(group['label'])}</div>")
+            sections.append(_render_model_pills(group.get("models") or [], tone="gemini"))
+            sections.append("</div>")
+        sections.append("</div>")
+
+    sections.append("</div>")
+    return "".join(sections)
+
+
+def _render_model_pills(models: list[dict[str, Any]], *, tone: str) -> str:
+    sections = [f"<div class='model-pill-list model-pill-list--{escape(tone)}'>"]
+    for model in models:
+        sections.append(f"<span class='model-pill model-pill--{escape(tone)}'>{escape(model['model_id'])}</span>")
+    sections.append("</div>")
+    return "".join(sections)
 
 
 def _dashboard_styles() -> str:
@@ -639,35 +791,100 @@ def _dashboard_styles() -> str:
     }
     .provider--gemini .provider__label { color: var(--gemini); }
     .provider--codex .provider__label { color: var(--codex); }
-    .account-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-      gap: 16px;
-      margin-top: 16px;
+    .account-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 14px;
     }
-    .account-card {
-      border-radius: 22px;
+    .account-row {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(0, 2.4fr) auto;
+      gap: 14px;
+      align-items: center;
+      border-radius: 20px;
       background: var(--panel-strong);
       border: 1px solid var(--line);
-      padding: 18px 18px 16px;
+      padding: 14px 16px;
       min-width: 0;
     }
-    .account-card__head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: start;
-      margin-bottom: 12px;
+    .account-row__identity {
+      min-width: 0;
     }
-    .account-card__title {
-      font-size: 20px;
+    .account-row__title {
+      font-size: 17px;
       font-weight: 700;
       word-break: break-word;
     }
-    .account-card__subtitle {
-      color: var(--muted);
-      font-size: 13px;
+    .account-row__title a {
+      color: inherit;
+      text-decoration: none;
+    }
+    .account-row__meta {
       margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .account-row__meta a {
+      color: inherit;
+      text-decoration: underline;
+      text-decoration-color: rgba(24, 34, 48, 0.18);
+      text-underline-offset: 2px;
+    }
+    .account-row__action {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: flex-end;
+      justify-self: end;
+      flex-shrink: 0;
+    }
+    .quota-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-width: 0;
+    }
+    .quota-brief {
+      min-width: 148px;
+      flex: 1 1 160px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(250,246,239,0.88));
+    }
+    .quota-brief--link {
+      display: block;
+      color: inherit;
+      text-decoration: none;
+    }
+    .quota-brief--error {
+      background: rgba(180, 35, 24, 0.05);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+    .quota-brief__head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .quota-brief__label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .quota-brief__value {
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .quota-brief__meta {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.45;
     }
     .chips {
       display: flex;
@@ -689,6 +906,23 @@ def _dashboard_styles() -> str:
       color: white;
       background: linear-gradient(135deg, var(--good), #0b5f4e);
     }
+    .chip--active {
+      color: white;
+      background: linear-gradient(135deg, var(--good), #0b5f4e);
+    }
+    .chip--action {
+      color: white;
+      background: linear-gradient(135deg, #c55a11, #8f3b08);
+    }
+    .chip-button {
+      appearance: none;
+      border: 0;
+      cursor: pointer;
+      font: inherit;
+    }
+    .chip-button:hover {
+      filter: brightness(0.97);
+    }
     .alert {
       border-radius: 16px;
       padding: 12px 14px;
@@ -698,6 +932,48 @@ def _dashboard_styles() -> str:
       border: 1px solid rgba(180, 35, 24, 0.18);
       background: rgba(180, 35, 24, 0.08);
       color: var(--bad);
+    }
+    .account-details {
+      margin-top: 14px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+    .account-details summary {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+      list-style: none;
+    }
+    .account-details summary::after {
+      content: "+";
+      font-size: 18px;
+      line-height: 1;
+      color: var(--muted);
+    }
+    .account-details[open] summary::after { content: "−"; }
+    .account-details summary::-webkit-details-marker { display: none; }
+    .account-details__body {
+      margin-top: 12px;
+    }
+    .detail-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .detail-link {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      border: 1px solid var(--line);
+      background: rgba(24, 34, 48, 0.04);
+      color: var(--ink);
     }
     .metrics {
       display: grid;
@@ -846,134 +1122,87 @@ def _dashboard_styles() -> str:
     }
     @media (max-width: 760px) {
       .shell { width: min(100vw - 18px, 1380px); }
-      .hero, .provider, .account-card { padding-left: 14px; padding-right: 14px; }
-      .provider__head, .account-card__head { flex-direction: column; align-items: start; }
+      .hero, .provider, .account-row { padding-left: 14px; padding-right: 14px; }
+      .provider__head, .account-row {
+        grid-template-columns: 1fr;
+        align-items: start;
+      }
+      .provider__head {
+        display: flex;
+        flex-direction: column;
+        align-items: start;
+      }
+      .account-row__action {
+        align-items: start;
+        justify-self: start;
+      }
+      .quota-brief {
+        min-width: 100%;
+      }
     }
     """
 
 
 def _render_gemini_account_card(account: dict[str, Any]) -> str:
-    sections = ["<article class='account-card'>"]
-    sections.append(_render_account_head(account, provider="gemini"))
-    sections.append(
-        _render_meta_chips(
-            [
-                ("disabled", account.get("disabled")),
-                ("project_id", account.get("project_id")),
-                ("subscription_tier", account.get("subscription_tier")),
-            ]
-        )
-    )
+    sections = ["<article class='account-row'>"]
+    sections.append(_render_account_identity(account))
     if account.get("quota_error"):
-        sections.append(f"<div class='alert'>quota_error={escape(str(account['quota_error']))}</div>")
-
-    sections.append("<div class='table-wrap'><table>")
-    sections.append(
-        "<thead><tr><th>Group</th><th>Models</th><th>Remaining</th><th>Reset Time</th><th>Reset In</th></tr></thead><tbody>"
-    )
-    for group in account.get("groups") or []:
-        quota = group.get("quota") or {}
-        remaining = quota.get("remaining_percent")
-        meter_class = _meter_class(remaining)
-        sections.append("<tr>")
-        sections.append(
-            "<td>"
-            f"<div class='group-name'><span>{escape(group['label'])}</span>"
-            f"<span class='group-badge'>shared bucket</span></div>"
-            + (
-                "<div class='model-alias'>multiple quota buckets detected inside this family</div>"
-                if group.get("mixed_quota")
-                else "<div class='model-alias'>models in this family currently share the same quota window</div>"
-            )
-            + "</td>"
-        )
-        sections.append("<td><div class='gemini-models'>")
-        for model in group.get("models") or []:
-            sections.append(f"<a href=\"{escape(model['url'])}\">{escape(model['model_id'])}</a>")
-        sections.append("</div></td>")
-        sections.append(
-            "<td>"
-            f"<div class='{escape(_chip_class(remaining))} chip'>{escape(_display_value(remaining, suffix='%'))}</div>"
-            f"<div class='meter {escape(meter_class)}'><span style=\"width:{_meter_width(remaining)}%\"></span></div>"
-            "</td>"
-        )
-        sections.append(f"<td class='mono'>{escape(_display_value(quota.get('reset_time')))}</td>")
-        sections.append(f"<td>{escape(_display_value(quota.get('reset_in')))}</td>")
-        sections.append("</tr>")
-    sections.append("</tbody></table></div></article>")
+        sections.append(_render_quota_error(str(account["quota_error"])))
+    else:
+        groups = account.get("groups") or []
+        if groups:
+            sections.append("<div class='quota-strip'>")
+            for group in groups:
+                group_url = next((model.get("url") for model in group.get("models") or [] if model.get("url")), None)
+                sections.append(
+                    _render_quota_brief(
+                        _compact_group_label(group["label"]),
+                        group.get("quota") or {},
+                        href=group_url,
+                    )
+                )
+            sections.append("</div>")
+        else:
+            sections.append(_render_quota_error("No Gemini quota groups returned for this account."))
+    sections.append(_render_account_action(account, provider="gemini"))
+    sections.append("</article>")
     return "".join(sections)
 
 
 def _render_codex_account_card(account: dict[str, Any]) -> str:
-    sections = ["<article class='account-card'>"]
-    sections.append(_render_account_head(account, provider="codex"))
-    sections.append(
-        _render_meta_chips(
-            [
-                ("disabled", account.get("disabled")),
-                ("account_id", account.get("account_id")),
-                ("plan_type", account.get("plan_type")),
-            ]
-        )
-    )
+    sections = ["<article class='account-row'>"]
+    sections.append(_render_account_identity(account))
     if account.get("quota_error"):
-        sections.append(f"<div class='alert'>quota_error={escape(str(account['quota_error']))}</div>")
+        sections.append(_render_quota_error(str(account["quota_error"])))
     else:
         quota = account.get("quota") or {}
-        sections.append("<div class='metrics'>")
         sections.append(
-            _render_window_metric(
+            "<div class='quota-strip'>"
+            + _render_quota_brief(
                 "Weekly",
                 quota.get("weekly") or {},
-                "Long-window shared quota for normal Codex work across all models.",
+                href=account.get("quota_url"),
             )
+            + "</div>"
         )
-        sections.append(
-            _render_window_metric(
-                "Burst",
-                quota.get("burst") or {},
-                "Short-window spike cap when OpenAI returns a secondary window.",
-            )
-        )
-        sections.append(
-            _render_window_metric(
-                "Code Review",
-                quota.get("code_review") or {},
-                "Separate allowance for review-style Codex actions when exposed upstream.",
-            )
-        )
-        sections.append("</div>")
-        sections.append(
-            "<div class='note'>`Weekly` is the main shared pool. `Burst` comes from the shorter "
-            "secondary window when the upstream usage API returns one. `Code Review` is a "
-            "separate review-specific window exposed by OpenAI's Codex usage endpoint.</div>"
-        )
-
-    sections.append("<div class='account-card__subtitle'>Available models</div>")
-    sections.append("<div class='codex-models'>")
-    for model in account.get("models") or []:
-        sections.append(f"<a href=\"{escape(model['url'])}\">{escape(model['model_id'])}</a>")
-    sections.append("</div></article>")
+    sections.append(_render_account_action(account, provider="codex"))
+    sections.append("</article>")
     return "".join(sections)
 
 
-def _render_account_head(account: dict[str, Any], *, provider: str) -> str:
+def _render_account_identity(account: dict[str, Any]) -> str:
     quota_url = account.get("quota_url")
     title = escape(account["email"])
-    if quota_url:
+    if quota_url and not account.get("quota_error"):
         title_html = f"<a href=\"{escape(quota_url)}\">{title}</a>"
     else:
         title_html = title
-    provider_badge = "Gemini account" if provider == "gemini" else "Codex account"
-    disabled_reason = account.get("disabled_reason")
-    subtitle = f"status={'disabled' if account.get('disabled') else 'ready'}"
-    if disabled_reason:
-        subtitle += f" | reason={disabled_reason}"
+    meta = "Quota unavailable" if account.get("quota_error") else ""
+    meta_html = f"<div class='account-row__meta'>{escape(meta)}</div>" if meta else ""
     return (
-        "<div class='account-card__head'>"
-        f"<div><div class='account-card__title'>{title_html}</div>"
-        f"<div class='account-card__subtitle'>{escape(subtitle)}</div></div>"
-        f"<div class='chip chip--solid'>{escape(provider_badge)}</div>"
+        "<div class='account-row__identity'>"
+        f"<div class='account-row__title'>{title_html}</div>"
+        f"{meta_html}"
         "</div>"
     )
 
@@ -984,6 +1213,93 @@ def _render_meta_chips(items: list[tuple[str, Any]]) -> str:
         chips.append(f"<div class='chip'>{escape(key)}={escape(_display_value(value))}</div>")
     chips.append("</div>")
     return "".join(chips)
+
+
+def _render_account_action(account: dict[str, Any], *, provider: str) -> str:
+    if account.get("is_active"):
+        return "<div class='account-row__action'><div class='chip chip--active'>Active account</div></div>"
+
+    return (
+        "<div class='account-row__action'>"
+        "<form method='post' "
+        f"action=\"{escape(account['activate_url'])}\">"
+        "<button type='submit' class='chip chip--action chip-button'>Become active account</button>"
+        "</form>"
+        "</div>"
+    )
+
+
+def _render_quota_brief(label: str, quota: dict[str, Any], *, href: str | None = None) -> str:
+    wrapper_tag = "a" if href else "div"
+    wrapper_attrs = (
+        f" class='quota-brief quota-brief--link' href=\"{escape(href)}\""
+        if href
+        else " class='quota-brief'"
+    )
+    title = escape(label)
+    remaining = quota.get("remaining_percent")
+    reset_in = _display_value(quota.get("reset_in"))
+    reset_time = _compact_reset_time(quota.get("reset_time"))
+    return (
+        f"<{wrapper_tag}{wrapper_attrs}>"
+        "<div class='quota-brief__head'>"
+        f"<div class='quota-brief__label'>{title}</div>"
+        f"<div class='quota-brief__value {escape(_tone_class(remaining))}'>{escape(_display_value(remaining, suffix='%'))}</div>"
+        "</div>"
+        f"<div class='quota-brief__meta'>Resets in {escape(reset_in)}<br><span class='mono'>{escape(reset_time)}</span></div>"
+        f"</{wrapper_tag}>"
+    )
+
+
+def _render_quota_error(message: str) -> str:
+    return (
+        "<div class='quota-strip'>"
+        "<div class='quota-brief quota-brief--error'>"
+        "<div class='quota-brief__head'>"
+        "<div class='quota-brief__label'>Quota unavailable</div>"
+        "<div class='quota-brief__value tone-bad'>N/A</div>"
+        "</div>"
+        f"<div class='quota-brief__meta'>{escape(message)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def _compact_group_label(label: str) -> str:
+    value = str(label or "")
+    if " (" in value:
+        value = value.split(" (", 1)[0]
+    if value.endswith(" pool"):
+        value = value[:-5]
+    return value
+
+
+def _compact_reset_time(value: Any) -> str:
+    text = _display_value(value)
+    if text == "N/A" or "T" not in text:
+        return text
+    date_part, time_part = text.split("T", 1)
+    suffix = "Z" if time_part.endswith("Z") else ""
+    time_core = time_part[:-1] if suffix else time_part
+    hhmm = ":".join(time_core.split(":")[:2])
+    return f"{date_part} {hhmm}{suffix}"
+
+
+def _render_account_details(summary_label: str, body_html: str) -> str:
+    return (
+        "<details class='account-details'>"
+        f"<summary>{escape(summary_label)}</summary>"
+        f"<div class='account-details__body'>{body_html}</div>"
+        "</details>"
+    )
+
+
+def _render_detail_links(items: list[tuple[str, str]]) -> str:
+    links = ["<div class='detail-links'>"]
+    for label, href in items:
+        links.append(f"<a class='detail-link' href=\"{escape(href)}\">{escape(label)}</a>")
+    links.append("</div>")
+    return "".join(links)
 
 
 def _render_window_metric(label: str, window: dict[str, Any], description: str | None = None) -> str:

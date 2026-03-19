@@ -18,7 +18,7 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
 class ServerSettings(BaseModel):
     host: str = "127.0.0.1"
-    port: int = 8000
+    port: int = 7860
 
 
 class ProviderSettings(BaseModel):
@@ -56,7 +56,7 @@ class Settings(BaseModel):
 
 def _default_config() -> dict:
     return {
-        "server": {"host": "127.0.0.1", "port": 8000},
+        "server": {"host": "127.0.0.1", "port": 7860},
         "providers": {
             "gemini": {
                 "quota_group": "gemini-all",

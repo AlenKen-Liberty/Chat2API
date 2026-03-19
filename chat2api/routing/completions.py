@@ -11,7 +11,7 @@ Routing logic:
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["completions"])
 
 
-def _call_backend(target: ModelTarget, request: ChatCompletionRequest):
+async def _call_backend(target: ModelTarget, request: ChatCompletionRequest):
     """
     Call the appropriate backend for target.
     Returns (stream_iterator | text_str, actual_model_id).
@@ -44,7 +44,7 @@ def _call_backend(target: ModelTarget, request: ChatCompletionRequest):
     return backend.generate_text(target, request), target.model_id
 
 
-def _execute_with_fallback(request: ChatCompletionRequest):
+async def _execute_with_fallback(request: ChatCompletionRequest):
     """
     Try primary provider; on rate-limit, fall back to the other provider.
 
@@ -56,7 +56,7 @@ def _execute_with_fallback(request: ChatCompletionRequest):
 
     # ── Try primary provider ──
     try:
-        result, actual_model_id = _call_backend(target, request)
+        result, actual_model_id = await _call_backend(target, request)
         return result, actual_model_id, target.requested_name, ""
 
     except ProviderRateLimitError as primary_err:
@@ -70,7 +70,7 @@ def _execute_with_fallback(request: ChatCompletionRequest):
     reason = f"{target.provider}-{target.quota_group}-exhausted"
 
     try:
-        result, actual_model_id = _call_backend(fallback, request)
+        result, actual_model_id = await _call_backend(fallback, request)
         return result, actual_model_id, target.requested_name, reason
 
     except ProviderRateLimitError as fallback_err:
@@ -94,7 +94,7 @@ def _execute_with_fallback(request: ChatCompletionRequest):
 
 
 @router.post("/chat/completions")
-def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(request: ChatCompletionRequest):
     # ── Validate model name early for a clean 400 ──
     try:
         get_model_router().resolve(request.model)
@@ -106,7 +106,7 @@ def create_chat_completion(request: ChatCompletionRequest):
 
     # ── Execute with cross-provider fallback ──
     try:
-        result, actual_model_id, requested_name, reason = _execute_with_fallback(request)
+        result, actual_model_id, requested_name, reason = await _execute_with_fallback(request)
     except HTTPException:
         raise
     except ProviderError as exc:
@@ -134,7 +134,7 @@ def create_chat_completion(request: ChatCompletionRequest):
     return JSONResponse(content=payload, headers=headers)
 
 
-def _openai_stream(chunks: Iterator[str], model: str, completion_id: str) -> Iterator[str]:
+async def _openai_stream(chunks: Iterator[str], model: str, completion_id: str) -> AsyncIterator[str]:
     try:
         for chunk in chunks:
             if chunk:
