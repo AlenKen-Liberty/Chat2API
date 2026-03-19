@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -20,13 +22,8 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 USER_AGENT = "GeminiCLI/1.0.0"
 
-# Kept in-process only; phase 1 reads existing CLI credentials and refreshes them.
-# The user must provide their own Gemini API keys or public OEM client IDs in .env.
-_CLIENT_PAIRS = []
-_gemini_client_id = os.getenv("GEMINI_CLIENT_ID")
-_gemini_client_secret = os.getenv("GEMINI_CLIENT_SECRET")
-if _gemini_client_id and _gemini_client_secret:
-    _CLIENT_PAIRS.append((_gemini_client_id, _gemini_client_secret))
+_CLIENT_SECRET_RE = re.compile(r"(GOCSPX-[A-Za-z0-9_-]+)")
+_CLIENT_ID_RE = re.compile(r"(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)")
 
 
 class GeminiAuthError(RuntimeError):
@@ -200,7 +197,7 @@ def get_preferred_account() -> GeminiAccount:
         active_email = (_read_json(ACCOUNTS_INDEX_PATH)).get("active_account")
 
     accounts = list_accounts()
-    enabled = [account for account in accounts if not account.disabled]
+    enabled = [account for account in accounts if not account.disabled] or accounts
     if not enabled:
         raise GeminiAuthError("No enabled Gemini accounts found in ~/.gemini/accounts")
 
@@ -230,7 +227,13 @@ def _post_form(params: dict[str, str]) -> dict[str, Any]:
 
 def refresh_token(refresh_token: str) -> GeminiToken:
     last_error: Exception | None = None
-    for client_id, client_secret in _CLIENT_PAIRS:
+    client_pairs = _client_pairs()
+    if not client_pairs:
+        raise GeminiAuthError(
+            "Gemini token refresh failed: no OAuth client credentials found in env or installed Gemini CLI"
+        )
+
+    for client_id, client_secret in client_pairs:
         try:
             payload = _post_form(
                 {
@@ -246,12 +249,22 @@ def refresh_token(refresh_token: str) -> GeminiToken:
                 expires_in=int(payload.get("expires_in", 3600)),
                 expiry_timestamp=int(time.time()) + int(payload.get("expires_in", 3600)),
             )
+        except urllib.error.HTTPError as exc:  # pragma: no cover - depends on live provider
+            body = exc.read().decode("utf-8", errors="ignore")[:500]
+            last_error = GeminiAuthError(f"HTTP {exc.code} {body}")
         except Exception as exc:  # pragma: no cover - depends on live provider
             last_error = exc
     raise GeminiAuthError(f"Gemini token refresh failed: {last_error}") from last_error
 
 
 def ensure_fresh_account(account: GeminiAccount, force: bool = False) -> GeminiAccount:
+    if account.disabled and not force and not account.token.is_expired():
+        account.disabled = False
+        account.disabled_reason = None
+        if _account_path(account.email).exists():
+            save_account(account)
+        return account
+
     if not force and not account.token.is_expired():
         return account
 
@@ -267,6 +280,8 @@ def ensure_fresh_account(account: GeminiAccount, force: bool = False) -> GeminiA
     refreshed.email = account.email
     refreshed.project_id = account.project_id or account.token.project_id
     account.token = refreshed
+    account.disabled = False
+    account.disabled_reason = None
     account.last_used = int(time.time())
 
     if not account.email:
@@ -277,3 +292,48 @@ def ensure_fresh_account(account: GeminiAccount, force: bool = False) -> GeminiA
     if _account_path(account.email).exists():
         save_account(account)
     return account
+
+
+def _client_pairs() -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for client_id_key, client_secret_key in [
+        ("GEMINI_CLIENT_ID", "GEMINI_CLIENT_SECRET"),
+        ("GEMINI_CLI_OAUTH_CLIENT_ID", "GEMINI_CLI_OAUTH_CLIENT_SECRET"),
+        ("OPENCLAW_GEMINI_OAUTH_CLIENT_ID", "OPENCLAW_GEMINI_OAUTH_CLIENT_SECRET"),
+    ]:
+        client_id = os.getenv(client_id_key)
+        client_secret = os.getenv(client_secret_key)
+        if client_id and client_secret and (client_id, client_secret) not in seen:
+            seen.add((client_id, client_secret))
+            pairs.append((client_id, client_secret))
+
+    extracted = _extract_gemini_cli_client_pair()
+    if extracted and extracted not in seen:
+        pairs.append(extracted)
+
+    return pairs
+
+
+def _extract_gemini_cli_client_pair() -> tuple[str, str] | None:
+    gemini_path = shutil.which("gemini")
+    if not gemini_path:
+        return None
+
+    resolved = Path(gemini_path).resolve()
+    candidates: list[Path] = []
+    if len(resolved.parents) >= 2:
+        candidates.append(resolved.parents[1] / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "src" / "code_assist" / "oauth2.js")
+        candidates.append(resolved.parents[1] / "node_modules" / "@google" / "gemini-cli-core" / "dist" / "code_assist" / "oauth2.js")
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        content = candidate.read_text(encoding="utf-8", errors="ignore")
+        id_match = _CLIENT_ID_RE.search(content)
+        secret_match = _CLIENT_SECRET_RE.search(content)
+        if id_match and secret_match:
+            return id_match.group(1), secret_match.group(1)
+
+    return None

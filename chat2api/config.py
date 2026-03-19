@@ -72,6 +72,15 @@ def _default_config() -> dict:
         "models": {
             "gemini": {"provider": "gemini", "model_id": "gemini-3.1-pro-preview"},
             "codex":  {"provider": "codex",  "model_id": "gpt-5.4"},
+            "gemini-thinking": {"provider": "gemini", "model_id": "gemini-3.1-pro-preview"},
+            "gemini-balanced": {"provider": "gemini", "model_id": "gemini-3-flash-preview"},
+            "gemini-fast": {"provider": "gemini", "model_id": "gemini-3.1-flash-lite-preview"},
+            "gemini-pro": {"provider": "gemini", "model_id": "gemini-3.1-pro-preview"},
+            "gemini-flash": {"provider": "gemini", "model_id": "gemini-3-flash-preview"},
+            "gemini-lite": {"provider": "gemini", "model_id": "gemini-3.1-flash-lite-preview"},
+            "codex-thinking": {"provider": "codex", "model_id": "gpt-5.4"},
+            "codex-balanced": {"provider": "codex", "model_id": "gpt-5.3-codex"},
+            "codex-fast": {"provider": "codex", "model_id": "gpt-5.1-codex-mini"},
         },
         "anti_detection": {
             "tls_strategy": "native",

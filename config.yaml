@@ -26,6 +26,15 @@ providers:
 # 主要别名：
 #   "gemini" → gemini provider 的 best_model (gemini-3.1-pro-preview)
 #   "codex"  → codex  provider 的 best_model (gpt-5.4)
+# 语义别名：
+#   Gemini:
+#     "gemini-thinking" / "gemini-pro"   -> gemini-3.1-pro-preview
+#     "gemini-balanced" / "gemini-flash" -> gemini-3-flash-preview
+#     "gemini-fast" / "gemini-lite"      -> gemini-3.1-flash-lite-preview
+#   Codex:
+#     "codex-thinking" -> gpt-5.4
+#     "codex-balanced" -> gpt-5.3-codex
+#     "codex-fast"     -> gpt-5.1-codex-mini
 #
 # 具体模型名称也可以填，路由到对应 provider，使用指定 model_id。
 # ═══════════════════════════════════════════════════════════════
@@ -38,6 +47,44 @@ models:
   codex:
     provider: codex
     model_id: "gpt-5.4"
+
+  # ── 语义别名：Gemini ──
+  gemini-thinking:
+    provider: gemini
+    model_id: "gemini-3.1-pro-preview"
+
+  gemini-balanced:
+    provider: gemini
+    model_id: "gemini-3-flash-preview"
+
+  gemini-fast:
+    provider: gemini
+    model_id: "gemini-3.1-flash-lite-preview"
+
+  gemini-pro:
+    provider: gemini
+    model_id: "gemini-3.1-pro-preview"
+
+  gemini-flash:
+    provider: gemini
+    model_id: "gemini-3-flash-preview"
+
+  gemini-lite:
+    provider: gemini
+    model_id: "gemini-3.1-flash-lite-preview"
+
+  # ── 语义别名：Codex ──
+  codex-thinking:
+    provider: codex
+    model_id: "gpt-5.4"
+
+  codex-balanced:
+    provider: codex
+    model_id: "gpt-5.3-codex"
+
+  codex-fast:
+    provider: codex
+    model_id: "gpt-5.1-codex-mini"
 
   # ── Gemini 完整模型列表（实测 2026-03-18，全部共享同一配额池）──
   gemini-3.1-pro-preview:

@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # ChatGPT backend endpoint used by Codex CLI with auth_mode: chatgpt
 # (tokens from auth.openai.com have only api.connectors.* scopes, so /v1/responses → 401)
 RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
+TRANSCRIPT_PREAMBLE = (
+    "Conversation history follows. Preserve the established context and answer only as the assistant "
+    "to the latest user turn."
+)
 
 
 class CodexBackend(ProviderBackend):
@@ -109,7 +113,7 @@ class CodexBackend(ProviderBackend):
         if not messages:
             raise ProviderRequestError("At least one non-system message is required")
 
-        input_items = [self._convert_message(msg) for msg in messages]
+        input_items = self._build_input_items(messages)
 
         payload: dict[str, Any] = {
             "model": target.model_id,
@@ -118,11 +122,26 @@ class CodexBackend(ProviderBackend):
             "stream": True,
             "store": False,     # required by chatgpt.com/backend-api/codex/responses
         }
-        # NOTE: chatgpt.com/backend-api/codex/responses does NOT accept
-        # temperature / top_p — sending them returns HTTP 400.
-        if request.max_tokens is not None:
-            payload["max_output_tokens"] = request.max_tokens
+        # NOTE: the ChatGPT Codex backend is stricter than OpenAI Chat Completions:
+        # unsupported generation knobs like temperature / top_p / max_tokens should
+        # be silently ignored here instead of passed upstream.
         return payload
+
+    def _build_input_items(self, messages: list[ChatMessage]) -> list[dict[str, Any]]:
+        text_messages = [message for message in messages if content_to_text(message.content)]
+        if not text_messages:
+            raise ProviderRequestError("No text content found in messages")
+
+        if len(text_messages) == 1 and text_messages[0].role == "user":
+            return [self._convert_message(text_messages[0])]
+
+        transcript = self._conversation_transcript(text_messages)
+        return [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": transcript}],
+            }
+        ]
 
     @staticmethod
     def _convert_message(message: ChatMessage) -> dict[str, Any]:
@@ -136,6 +155,23 @@ class CodexBackend(ProviderBackend):
                 }
             ],
         }
+
+    def _conversation_transcript(self, messages: list[ChatMessage]) -> str:
+        blocks = [TRANSCRIPT_PREAMBLE]
+        for message in messages:
+            label = self._message_label(message)
+            text = content_to_text(message.content).strip() or "[empty]"
+            blocks.append(f"{label}:\n{text}")
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _message_label(message: ChatMessage) -> str:
+        role = message.role.upper()
+        if message.name:
+            return f"{role} ({message.name})"
+        if message.tool_call_id:
+            return f"{role} ({message.tool_call_id})"
+        return role
 
     @staticmethod
     def _response_error(response: Any) -> str:

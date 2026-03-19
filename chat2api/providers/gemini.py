@@ -32,11 +32,11 @@ class GeminiBackend(ProviderBackend):
         self.tls_client = tls_client
 
     def _get_accounts(self):
-        """Return all enabled Gemini accounts sorted by least-recently-used first."""
-        accounts = [acc for acc in list_accounts() if not acc.disabled]
+        """Return Gemini accounts sorted by enabled-first and least-recently-used."""
+        accounts = list_accounts()
         if not accounts:
-            raise ProviderAuthError("No enabled Gemini accounts found")
-        return sorted(accounts, key=lambda a: a.last_used)
+            raise ProviderAuthError("No Gemini accounts found")
+        return sorted(accounts, key=lambda a: (a.disabled, a.last_used))
 
     def stream_text(self, target: ModelTarget, request: ChatCompletionRequest) -> Iterator[str]:
         """
