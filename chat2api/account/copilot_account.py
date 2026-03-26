@@ -207,12 +207,12 @@ def get_active_account_email() -> str | None:
 
 
 def fetch_copilot_premium_usage(github_token: str) -> dict[str, Any] | None:
-    """Fetch premium request usage from GitHub's Copilot billing endpoint.
+    """Fetch premium request usage from GitHub's Copilot internal token endpoint.
 
-    Tries GET https://api.github.com/user/copilot to retrieve premium usage.
-    Returns a dict with: usage_percent, limit, reset_date  — or None if unavailable.
+    Tries GET https://api.github.com/copilot_internal/v2/token to retrieve premium usage.
+    Returns a dict with: usage_percent, limit, reset_date, used — or None if unavailable/unlimited.
     """
-    req = urllib.request.Request(COPILOT_BILLING_URL)
+    req = urllib.request.Request(COPILOT_TOKEN_URL)
     req.add_header("Authorization", f"token {github_token}")
     req.add_header("User-Agent", "Chat2API/1.0")
     req.add_header("Accept", "application/json")
@@ -220,32 +220,51 @@ def fetch_copilot_premium_usage(github_token: str) -> dict[str, Any] | None:
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.HTTPError, urllib.error.URLError, Exception) as exc:
-        logger.debug("Copilot billing fetch failed: %s", exc)
+    except Exception as exc:
+        logger.debug("Copilot token fetch for usage failed: %s", exc)
         return None
 
-    # Try to extract premium request usage from the response.
-    # GitHub's response structure may include fields like:
-    #   - seat.premium_requests_used / seat.premium_requests_limit
-    #   - or a top-level premium_requests_usage_percent
-    seat = data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return None
 
-    # Try top-level fields first
-    usage_pct = seat.get("premium_requests_usage_percent")
-    if usage_pct is not None:
-        try:
-            return {
-                "usage_percent": round(float(usage_pct), 1),
-                "limit": seat.get("premium_requests_limit"),
-                "reset_date": seat.get("premium_requests_reset_date"),
-            }
-        except (TypeError, ValueError):
-            pass
+    # The token response contains 'limited_user_quotas' and 'limited_user_reset_date'
+    # 'limited_user_quotas' is often None for users without limits, but may contain
+    # a dict when usage is being tracked, e.g. {"chat": {"used": 50, "limit": 300}}
+    # or similar structure based on GitHub's API.
+    # Since the exact format is undocumented, we look for 'used' and 'limit' keys generically
+    # or we handle known structures if they appear.
+    
+    quotas = data.get("limited_user_quotas")
+    reset_date = data.get("limited_user_reset_date")
 
-    # Try nested seat structure
-    inner = seat.get("seat") or seat
-    used = inner.get("premium_requests_used")
-    limit = inner.get("premium_requests_limit") or inner.get("plan_premium_requests")
+    if not quotas or not isinstance(quotas, dict):
+        # If no explicit quota data is returned, we can't derive a precise live percentage.
+        # But we can at least return the reset date if it exists.
+        if reset_date:
+            return {"reset_date": reset_date}
+        return None
+
+    # Try to find 'used' and 'limit' in the quotas dict.
+    # Typical structure might be {"chat": {"limit": 300, "used": 8}} or similar
+    used = None
+    limit = None
+    
+    # Flatten the dict to look for 'used' and 'limit'
+    def find_keys(d, target_key):
+        if not isinstance(d, dict):
+            return None
+        if target_key in d:
+            return d[target_key]
+        for v in d.values():
+            if isinstance(v, dict):
+                res = find_keys(v, target_key)
+                if res is not None:
+                    return res
+        return None
+
+    used = find_keys(quotas, "used")
+    limit = find_keys(quotas, "limit") or find_keys(quotas, "quota")
+
     if used is not None and limit:
         try:
             pct = round(float(used) / float(limit) * 100, 1)
@@ -253,11 +272,10 @@ def fetch_copilot_premium_usage(github_token: str) -> dict[str, Any] | None:
                 "usage_percent": pct,
                 "used": int(used),
                 "limit": int(limit),
-                "reset_date": inner.get("premium_requests_reset_date"),
+                "reset_date": reset_date,
             }
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
-    # If we got data but no usage fields we recognize, return what we have
-    logger.debug("Copilot billing response has no recognized usage fields: %s", list(seat.keys()))
-    return None
+    return {"reset_date": reset_date}
+
