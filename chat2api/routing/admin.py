@@ -1283,9 +1283,38 @@ def _render_provider_overview(provider: dict[str, Any]) -> str:
 def _render_model_pills(models: list[dict[str, Any]], *, tone: str) -> str:
     sections = [f"<div class='model-pill-list model-pill-list--{escape(tone)}'>"]
     for model in models:
-        sections.append(f"<span class='model-pill model-pill--{escape(tone)}'>{escape(model['model_id'])}</span>")
+        aliases = model.get("aliases") or []
+        aliases_html = ""
+        if aliases:
+            alias_chips = "".join(f"<span class='model-alias'>{escape(a)}</span>" for a in aliases)
+            aliases_html = f"<div class='model-alias-row'>{alias_chips}</div>"
+        sections.append(
+            f"<span class='model-pill model-pill--{escape(tone)}'>"
+            f"{escape(model['model_id'])}"
+            f"{aliases_html}"
+            f"</span>"
+        )
     sections.append("</div>")
     return "".join(sections)
+
+
+def _render_model_list_with_aliases(models: list[dict[str, Any]], *, tone: str) -> str:
+    """Render a compact model table with model ID and alias pills."""
+    if not models:
+        return "<div class='model-table-empty'>No models configured</div>"
+    rows = ["<div class='model-table'>"]
+    for m in models:
+        model_id = m["model_id"]
+        aliases = [a for a in (m.get("aliases") or []) if a != model_id]
+        alias_html = "".join(f"<span class='model-alias'>{escape(a)}</span>" for a in aliases)
+        rows.append(
+            f"<div class='model-table__row'>"
+            f"<span class='model-pill model-pill--{escape(tone)}'>{escape(model_id)}</span>"
+            f"<span class='model-alias-row'>{alias_html}</span>"
+            f"</div>"
+        )
+    rows.append("</div>")
+    return "".join(rows)
 
 
 def _dashboard_styles() -> str:
@@ -1656,11 +1685,49 @@ def _dashboard_styles() -> str:
       color: var(--gemini);
     }
     .model-alias {
+      display: inline-block;
       color: var(--muted);
-      font-size: 12px;
-      margin-top: 4px;
-      line-height: 1.4;
+      font-size: 11px;
+      background: rgba(24, 34, 48, 0.06);
+      border-radius: 4px;
+      padding: 1px 5px;
+      margin: 2px 2px 0 0;
+      font-family: "IBM Plex Mono", monospace;
     }
+    .model-alias-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px;
+      margin-top: 4px;
+    }
+    .model-section {
+      padding: 12px 16px 12px;
+      border-top: 1px solid var(--line);
+    }
+    .model-section__label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .model-table {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .model-table__row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .model-table-empty {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
     .meter {
       margin-top: 8px;
       height: 8px;
@@ -1786,6 +1853,12 @@ def _render_codex_account_card(account: dict[str, Any]) -> str:
             )
             + "</div>"
         )
+        models = account.get("models") or []
+        if models:
+            sections.append("<div class='model-section'>")
+            sections.append("<div class='model-section__label'>Available Models &amp; Aliases</div>")
+            sections.append(_render_model_list_with_aliases(models, tone="codex"))
+            sections.append("</div>")
     sections.append(_render_account_action(account, provider="codex"))
     sections.append("</article>")
     return "".join(sections)
@@ -1823,6 +1896,12 @@ def _render_copilot_account_card(account: dict[str, Any]) -> str:
             )
         )
         sections.append("</div>")
+        models = account.get("models") or []
+        if models:
+            sections.append("<div class='model-section'>")
+            sections.append("<div class='model-section__label'>Available Models &amp; Aliases</div>")
+            sections.append(_render_model_list_with_aliases(models, tone="copilot"))
+            sections.append("</div>")
     sections.append(_render_static_account_action(account.get("status_badge") or "GitHub OAuth", tone="solid"))
     sections.append("</article>")
     return "".join(sections)
@@ -1851,15 +1930,13 @@ def _render_groq_account_card(account: dict[str, Any]) -> str:
                 tone="neutral",
             )
         )
-        sections.append(
-            _render_info_brief(
-                "Configured Models",
-                str(len(account.get("models") or [])),
-                ", ".join(model["model_id"] for model in account.get("models") or []) or "No models configured",
-                tone="neutral",
-            )
-        )
         sections.append("</div>")
+        models = account.get("models") or []
+        if models:
+            sections.append("<div class='model-section'>")
+            sections.append("<div class='model-section__label'>Available Models &amp; Aliases</div>")
+            sections.append(_render_model_list_with_aliases(models, tone="groq"))
+            sections.append("</div>")
     sections.append(_render_static_account_action(account.get("status_badge") or "API key"))
     sections.append("</article>")
     return "".join(sections)
