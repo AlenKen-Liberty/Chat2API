@@ -28,7 +28,7 @@ class ProviderSettings(BaseModel):
 
 
 class ModelEntrySettings(BaseModel):
-    provider: Literal["gemini", "codex"]
+    provider: str
     model_id: str
 
 
@@ -56,7 +56,7 @@ class Settings(BaseModel):
 
 def _default_config() -> dict:
     return {
-        "server": {"host": "127.0.0.1", "port": 7860},
+        "server": {"host": "0.0.0.0", "port": 7860},
         "providers": {
             "gemini": {
                 "quota_group": "gemini-all",
@@ -66,21 +66,24 @@ def _default_config() -> dict:
             "codex": {
                 "quota_group": "codex-weekly",
                 "best_model": "gpt-5.4",
+                "fallback": "copilot",
+            },
+            "copilot": {
+                "quota_group": "copilot-daily",
+                "best_model": "gpt-4o",
+                "fallback": "groq",
+            },
+            "groq": {
+                "quota_group": "groq-free",
+                "best_model": "llama-3.3-70b-versatile",
                 "fallback": "gemini",
             },
         },
         "models": {
             "gemini": {"provider": "gemini", "model_id": "gemini-3.1-pro-preview"},
             "codex":  {"provider": "codex",  "model_id": "gpt-5.4"},
-            "gemini-thinking": {"provider": "gemini", "model_id": "gemini-3.1-pro-preview"},
-            "gemini-balanced": {"provider": "gemini", "model_id": "gemini-3-flash-preview"},
-            "gemini-fast": {"provider": "gemini", "model_id": "gemini-3.1-flash-lite-preview"},
-            "gemini-pro": {"provider": "gemini", "model_id": "gemini-3.1-pro-preview"},
-            "gemini-flash": {"provider": "gemini", "model_id": "gemini-3-flash-preview"},
-            "gemini-lite": {"provider": "gemini", "model_id": "gemini-3.1-flash-lite-preview"},
-            "codex-thinking": {"provider": "codex", "model_id": "gpt-5.4"},
-            "codex-balanced": {"provider": "codex", "model_id": "gpt-5.3-codex"},
-            "codex-fast": {"provider": "codex", "model_id": "gpt-5.1-codex-mini"},
+            "copilot": {"provider": "copilot", "model_id": "gpt-4o"},
+            "groq": {"provider": "groq", "model_id": "llama-3.3-70b-versatile"},
         },
         "anti_detection": {
             "tls_strategy": "native",

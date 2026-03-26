@@ -8,11 +8,18 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from chat2api.account.copilot_account import (
+    CopilotAuthError,
+    PREMIUM_REQUEST_RESET_NOTE as COPILOT_PREMIUM_RESET_NOTE,
+    ensure_fresh_account as ensure_fresh_copilot_account,
+    get_active_account_email as get_active_copilot_account_email,
+)
 from chat2api.account.codex_account import (
     CodexAuthError,
     ensure_fresh_account as ensure_fresh_codex_account,
     get_active_account_email as get_active_codex_account_email,
     list_accounts as list_codex_accounts,
+    save_account as save_codex_account,
     set_active_account as set_active_codex_account,
 )
 from chat2api.account.gemini_account import (
@@ -23,6 +30,7 @@ from chat2api.account.gemini_account import (
     set_active_account as set_active_gemini_account,
 )
 from chat2api.config import get_settings
+from chat2api.providers.openai_compat import describe_api_keys
 from chat2api.quota import (
     CODEX_USAGE_URL,
     RETRIEVE_USER_QUOTA_URL,
@@ -40,11 +48,44 @@ from chat2api.quota import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+PROVIDER_ORDER = ("codex", "gemini", "copilot", "groq")
+COPILOT_PREMIUM_MODEL_MULTIPLIERS = {
+    "claude-haiku-4.5": 0.33,
+    "claude-opus-4.1": 10.0,
+    "claude-opus-4.5": 3.0,
+    "claude-sonnet-4": 1.0,
+    "claude-sonnet-4.5": 1.0,
+    "gemini-2.5-pro": 1.0,
+    "gemini-3-flash": 0.33,
+    "gemini-3-pro": 1.0,
+    "gpt-4.1": 0.0,
+    "gpt-4o": 0.0,
+    "gpt-5": 1.0,
+    "gpt-5 mini": 0.0,
+    "gpt-5-codex": 1.0,
+    "gpt-5.1": 1.0,
+    "gpt-5.1-codex": 1.0,
+    "gpt-5.1-codex-mini": 0.33,
+    "grok-code-fast-1": 0.25,
+    "raptor mini": 0.0,
+}
+
+
+def _provider_display_name(provider_name: str) -> str:
+    return {
+        "codex": "Codex",
+        "gemini": "Gemini",
+        "copilot": "GitHub Copilot",
+        "groq": "Groq",
+    }.get(provider_name, provider_name.title())
+
 
 @router.get("/health")
 async def admin_health() -> dict:
     gemini_accounts = list_gemini_accounts()
     codex_accounts = list_codex_accounts()
+    copilot_account = _load_copilot_dashboard_account()
+    groq_keys = describe_api_keys("groq")
     return {
         "status": "healthy",
         "providers": {
@@ -56,17 +97,34 @@ async def admin_health() -> dict:
                 "accounts": len(codex_accounts),
                 "enabled_accounts": sum(1 for account in codex_accounts if not account.disabled),
             },
+            "copilot": {
+                "accounts": 1 if copilot_account.get("configured") else 0,
+                "enabled_accounts": 1 if copilot_account.get("configured") else 0,
+            },
+            "groq": {
+                "accounts": groq_keys["key_count"],
+                "enabled_accounts": groq_keys["key_count"],
+            },
         },
     }
 
 
 @router.get("/quota-urls", name="admin_quota_urls")
-async def admin_quota_urls(request: Request):
+async def admin_quota_urls(request: Request, provider: str | None = None, fresh: int = 0):
+    if provider:
+        use_cache = not fresh
+        entry = _build_single_provider_entry(request, provider, use_cache=use_cache)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"Unknown provider '{provider}'")
+        if _wants_html(request):
+            return HTMLResponse(_render_provider_fragment(entry))
+        return entry
+    if _wants_html(request):
+        provider_names = _available_provider_names()
+        return HTMLResponse(_render_quota_urls_html_tabbed(request, provider_names))
     payload = {
         "providers": _build_provider_entries(request),
     }
-    if _wants_html(request):
-        return HTMLResponse(_render_quota_urls_html(payload))
     return payload
 
 
@@ -147,51 +205,335 @@ def _get_model_entry(provider: str, model_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found for provider '{provider}'")
 
 
+def _provider_quota_group(provider_name: str) -> str | None:
+    provider = get_settings().providers.get(provider_name)
+    return provider.quota_group if provider else None
+
+
+def _provider_usage_note(provider_name: str) -> str | None:
+    if provider_name == "gemini":
+        return (
+            "Gemini cards group models by the live quota bucket returned by retrieveUserQuota. "
+            "When multiple models currently share the same remaining percentage and reset time, they collapse into one pool."
+        )
+    if provider_name == "codex":
+        return (
+            "Codex exposes one shared account-level quota pool. The upstream usage payload also exposes a shorter "
+            "secondary window when present, plus a separate code-review window."
+        )
+    if provider_name == "copilot":
+        return (
+            "GitHub Copilot uses GitHub OAuth. On paid plans and Copilot Student, GPT-4o, GPT-4.1, and GPT-5 mini "
+            "are included chat models and do not consume premium requests; premium models consume the monthly "
+            "premium pool using their per-model multiplier. Premium request counters reset on the 1st of each month "
+            "at 00:00 UTC."
+        )
+    if provider_name == "groq":
+        return (
+            "Groq uses API keys. This tab shows local key wiring from .env or ~/.chat2api/keys/groq.txt and the "
+            "configured model map; it does not fetch live account usage from Groq."
+        )
+    return None
+
+
 def _build_provider_entries(request: Request) -> list[dict[str, Any]]:
+    entries = []
+    for provider_name in _available_provider_names():
+        entry = _build_single_provider_entry(request, provider_name, use_cache=False)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _available_provider_names() -> list[str]:
     settings = get_settings()
+    names = [name for name in PROVIDER_ORDER if settings.providers.get(name)]
+    return names or list(PROVIDER_ORDER)
+
+
+def _build_single_provider_entry(
+    request: Request, provider_name: str, *, use_cache: bool = False,
+) -> dict[str, Any] | None:
     models = _configured_models()
-    gemini_active_email = get_active_gemini_account_email()
-    codex_active_email = get_active_codex_account_email()
-    return [
-        {
+    if provider_name == "gemini":
+        active_email = get_active_gemini_account_email()
+        builder = _build_gemini_account_entry_cached if use_cache else _build_gemini_account_entry
+        return {
             "provider": "gemini",
-            "quota_group": settings.providers.get("gemini").quota_group if settings.providers.get("gemini") else None,
+            "quota_group": _provider_quota_group("gemini"),
             "shared_quota": False,
-            "usage_note": (
-                "Gemini cards group models by the live quota bucket returned by retrieveUserQuota. "
-                "When multiple models currently share the same remaining percentage and reset time, they collapse into one pool."
-            ),
+            "usage_note": _provider_usage_note("gemini"),
             "accounts": [
-                _build_gemini_account_entry(
-                    request,
-                    account,
-                    models.get("gemini", []),
-                    active_email=gemini_active_email,
-                )
+                builder(request, account, models.get("gemini", []), active_email=active_email)
                 for account in list_gemini_accounts()
             ],
-        },
-        {
+        }
+    if provider_name == "codex":
+        active_email = get_active_codex_account_email()
+        builder = _build_codex_account_entry_cached if use_cache else _build_codex_account_entry
+        return {
             "provider": "codex",
-            "quota_group": settings.providers.get("codex").quota_group if settings.providers.get("codex") else None,
+            "quota_group": _provider_quota_group("codex"),
             "shared_quota": True,
-            "usage_note": (
-                "Codex exposes one shared account-level quota pool. "
-                "The upstream usage payload also exposes a shorter secondary window when present, plus a separate "
-                "code-review window. OpenAI documents that model and task complexity change average credit cost, "
-                "so stronger models can drain the same pool faster than mini variants."
-            ),
+            "usage_note": _provider_usage_note("codex"),
             "accounts": [
-                _build_codex_account_entry(
-                    request,
-                    account,
-                    models.get("codex", []),
-                    active_email=codex_active_email,
-                )
+                builder(request, account, models.get("codex", []), active_email=active_email)
                 for account in list_codex_accounts()
             ],
-        },
-    ]
+        }
+    if provider_name == "copilot":
+        return _build_copilot_provider_entry(request, models.get("copilot", []))
+    if provider_name == "groq":
+        return _build_groq_provider_entry(request, models.get("groq", []))
+    return None
+
+
+def _load_copilot_dashboard_account() -> dict[str, Any]:
+    try:
+        account = ensure_fresh_copilot_account()
+    except CopilotAuthError as exc:
+        return {
+            "configured": False,
+            "display_name": "GitHub Copilot OAuth",
+            "email": "github-copilot",
+            "plan_name": "Plan unavailable",
+            "sku": None,
+            "api_base": None,
+            "auth_mode": "GitHub OAuth",
+            "premium_requests_per_month": None,
+            "premium_usage": None,
+            "quota_error": str(exc),
+        }
+
+    return {
+        "configured": True,
+        "display_name": account.username or "GitHub Copilot",
+        "email": account.email,
+        "plan_name": account.plan_name,
+        "sku": account.sku,
+        "api_base": account.api_base,
+        "auth_mode": account.auth_mode,
+        "premium_requests_per_month": account.premium_requests_per_month,
+        "premium_usage": account.premium_usage,
+        "quota_error": None,
+    }
+
+
+def _copilot_model_policy(model_id: str) -> dict[str, Any]:
+    multiplier = COPILOT_PREMIUM_MODEL_MULTIPLIERS.get(model_id)
+    if multiplier is None:
+        return {
+            "kind": "unknown",
+            "multiplier": None,
+            "multiplier_label": "unknown",
+            "description": "Not listed in the current GitHub model-multiplier docs.",
+        }
+    if float(multiplier) == 0.0:
+        return {
+            "kind": "included",
+            "multiplier": multiplier,
+            "multiplier_label": "included",
+            "description": "Included model on paid plans and Copilot Student.",
+        }
+    return {
+        "kind": "premium",
+        "multiplier": multiplier,
+        "multiplier_label": f"{multiplier:g}x",
+        "description": "Consumes premium requests using the documented multiplier.",
+    }
+
+
+def _build_copilot_provider_entry(request: Request, provider_models: list[dict[str, Any]]) -> dict[str, Any]:
+    account = _load_copilot_dashboard_account()
+    active_email = get_active_copilot_account_email()
+
+    model_entries = []
+    included_models: list[str] = []
+    premium_models: list[str] = []
+    unknown_models: list[str] = []
+    for model in provider_models:
+        policy = _copilot_model_policy(model["model_id"])
+        enriched = {
+            **model,
+            "policy": policy,
+        }
+        model_entries.append(enriched)
+        if policy["kind"] == "included":
+            included_models.append(model["model_id"])
+        elif policy["kind"] == "premium":
+            premium_models.append(f"{model['model_id']} ({policy['multiplier_label']})")
+        else:
+            unknown_models.append(model["model_id"])
+
+    premium_requests = account.get("premium_requests_per_month")
+    premium_usage = account.get("premium_usage")
+    plan_is_free = premium_requests == 50 and str(account.get("plan_name")).startswith("Copilot Free")
+    included_summary = "Counts toward premium" if plan_is_free else "Unlimited"
+    included_meta = (
+        "Copilot Free counts chat requests against the premium request pool."
+        if plan_is_free
+        else "Paid plans and Copilot Student include GPT-4o / GPT-4.1 / GPT-5 mini chat without premium-request spend."
+    )
+
+    # Build premium summary — prefer live usage %, fall back to entitlement
+    if premium_usage and premium_usage.get("usage_percent") is not None:
+        pct = premium_usage["usage_percent"]
+        premium_summary = f"{pct}%"
+        limit = premium_usage.get("limit") or premium_requests
+        used = premium_usage.get("used")
+        if used is not None and limit:
+            premium_meta_text = f"{used} / {limit} premium requests used. {COPILOT_PREMIUM_RESET_NOTE}."
+        else:
+            premium_meta_text = (
+                f"{pct}% of premium requests used"
+                f" ({limit}/month entitlement)." if limit else "."
+            ) + f" {COPILOT_PREMIUM_RESET_NOTE}."
+    elif isinstance(premium_requests, int):
+        premium_summary = f"{premium_requests}/month"
+        premium_meta_text = f"Premium models use per-model multipliers. {COPILOT_PREMIUM_RESET_NOTE}."
+    else:
+        premium_summary = "Plan-dependent"
+        premium_meta_text = f"Premium models use per-model multipliers. {COPILOT_PREMIUM_RESET_NOTE}."
+
+    return {
+        "provider": "copilot",
+        "quota_group": _provider_quota_group("copilot"),
+        "shared_quota": True,
+        "usage_note": _provider_usage_note("copilot"),
+        "accounts": [
+            {
+                "email": str(account["email"]),
+                "display_name": str(account["display_name"]),
+                "disabled": False,
+                "is_active": str(account["email"]) == active_email or active_email is None,
+                "meta_items": [
+                    "GitHub OAuth",
+                    str(account["plan_name"]),
+                    f"sku={account['sku']}" if account.get("sku") else None,
+                    account.get("api_base"),
+                ],
+                "quota_error": account.get("quota_error"),
+                "status_badge": "GitHub OAuth",
+                "models": model_entries,
+                "included_models": included_models,
+                "premium_models": premium_models,
+                "unknown_models": unknown_models,
+                "included_summary": included_summary,
+                "included_meta": included_meta,
+                "premium_summary": premium_summary,
+                "premium_meta": premium_meta_text,
+                "auth_summary": str(account["plan_name"]),
+                "auth_meta": "OAuth token -> Copilot session token exchange via GitHub.",
+            }
+        ],
+    }
+
+
+def _build_groq_provider_entry(request: Request, provider_models: list[dict[str, Any]]) -> dict[str, Any]:
+    key_info = describe_api_keys("groq")
+    source_summary = ", ".join(key_info["sources"]) if key_info["sources"] else "No key source detected"
+    return {
+        "provider": "groq",
+        "quota_group": _provider_quota_group("groq"),
+        "shared_quota": True,
+        "usage_note": _provider_usage_note("groq"),
+        "accounts": [
+            {
+                "email": "groq",
+                "display_name": "Groq API keys",
+                "disabled": not key_info["configured"],
+                "is_active": key_info["configured"],
+                "meta_items": [
+                    "OpenAI-compatible API",
+                    "https://api.groq.com/openai/v1",
+                ],
+                "quota_error": (
+                    None
+                    if key_info["configured"]
+                    else "No Groq API key configured. Set GROQ_API_KEY in .env or ~/.chat2api/keys/groq.txt."
+                ),
+                "status_badge": "API key",
+                "models": provider_models,
+                "keys_summary": str(key_info["key_count"]),
+                "keys_meta": source_summary,
+                "config_summary": "Ready" if key_info["configured"] else "Missing",
+                "config_meta": "Environment variables are loaded from .env at startup.",
+                "masked_keys": key_info["masked_keys"],
+            }
+        ],
+    }
+
+
+def _build_codex_account_entry_cached(
+    request: Request,
+    account: Any,
+    provider_models: list[dict[str, Any]],
+    *,
+    active_email: str | None,
+) -> dict[str, Any]:
+    """Build codex account entry using cached quota_snapshot (no API calls)."""
+    entry = _base_account_entry(request, "codex", account, provider_models, shared_quota=True, active_email=active_email)
+    if account.disabled:
+        entry["disabled_reason"] = getattr(account, "disabled_reason", None)
+        entry["quota_error"] = "Account is disabled"
+        return entry
+
+    entry["account_id"] = account.account_id
+    entry["plan_type"] = account.plan_type
+    entry["cached"] = True
+
+    snapshot = account.quota_snapshot
+    if not snapshot:
+        entry["quota_error"] = "No cached quota (click Refresh)"
+        return entry
+
+    entry["plan_type"] = snapshot.get("plan_type") or account.plan_type
+    quota_summary = {
+        "weekly": _codex_window((snapshot.get("rate_limit") or {}).get("primary_window") or {}),
+        "burst": _codex_window((snapshot.get("rate_limit") or {}).get("secondary_window") or {}),
+        "code_review": _codex_window((snapshot.get("code_review_rate_limit") or {}).get("primary_window") or {}),
+    }
+    entry["quota"] = quota_summary
+    return entry
+
+
+def _build_gemini_account_entry_cached(
+    request: Request,
+    account: Any,
+    provider_models: list[dict[str, Any]],
+    *,
+    active_email: str | None,
+) -> dict[str, Any]:
+    """Build gemini account entry using cached quota (no API calls)."""
+    entry = _base_account_entry(request, "gemini", account, provider_models, shared_quota=False, active_email=active_email)
+    entry["disabled"] = account.disabled
+    entry["disabled_reason"] = getattr(account, "disabled_reason", None)
+    entry["project_id"] = getattr(account, "project_id", None)
+    entry["subscription_tier"] = getattr(account, "subscription_tier", None)
+    entry["cached"] = True
+
+    cached_quota = getattr(account, "quota", None) or {}
+    cached_models = cached_quota.get("models") or []
+    if not cached_models:
+        entry["quota_error"] = "No cached quota (click Refresh)"
+        return entry
+
+    pct_by_model = {m["name"]: m.get("pct") for m in cached_models if m.get("name")}
+
+    for model in entry["models"]:
+        pct = pct_by_model.get(model["model_id"])
+        if pct is None:
+            model["quota_error"] = "Not in cache"
+            continue
+        model["quota"] = {
+            "remaining_fraction": pct / 100.0 if pct is not None else None,
+            "remaining_percent": float(pct) if pct is not None else None,
+            "reset_time": None,
+            "reset_in": None,
+        }
+
+    entry["groups"] = _group_gemini_models(entry["models"])
+    return entry
 
 
 def _build_gemini_account_entry(
@@ -288,6 +630,13 @@ def _build_codex_account_entry(
         "code_review": _codex_window((usage.get("code_review_rate_limit") or {}).get("primary_window") or {}),
     }
     entry["quota"] = quota_summary
+
+    # Persist snapshot for instant cache loads
+    try:
+        account.quota_snapshot = usage
+        save_codex_account(account)
+    except Exception:
+        pass
 
     return entry
 
@@ -592,9 +941,173 @@ def _gemini_family(model_id: str) -> str:
 
 
 def _provider_sort_key(provider: dict[str, Any]) -> tuple[int, str]:
-    order = {"codex": 0, "gemini": 1}
     name = str(provider.get("provider") or "")
+    order = {provider_name: index for index, provider_name in enumerate(PROVIDER_ORDER)}
     return (order.get(name, 99), name)
+
+
+def _render_provider_fragment(provider: dict[str, Any]) -> str:
+    """Render a single provider section as an HTML fragment (no <html> wrapper)."""
+    provider_name = provider["provider"]
+    provider_class = f"provider--{escape(provider_name)}"
+    sections = []
+    sections.append(f"<section class='provider {provider_class}'>")
+    sections.append("<div class='provider__head'>")
+    sections.append(
+        f"<div><div class='provider__label'>{escape(_provider_display_name(provider_name))}</div>"
+        f"<div class='provider__meta'>{escape(_provider_summary(provider_name))}</div></div>"
+    )
+    sections.append(f"<div class='provider__count'>{len(provider.get('accounts') or [])} account(s)</div>")
+    sections.append("</div>")
+    if provider.get("usage_note"):
+        sections.append(f"<div class='provider__note'>{escape(str(provider['usage_note']))}</div>")
+
+    accounts = provider.get("accounts") or []
+    if not accounts:
+        sections.append("<div class='empty'>No accounts found.</div>")
+        sections.append("</section>")
+        return "".join(sections)
+
+    sections.append("<div class='account-list'>")
+    for account in sorted(accounts, key=_account_sort_key):
+        if provider_name == "gemini":
+            sections.append(_render_gemini_account_card(account))
+        elif provider_name == "codex":
+            sections.append(_render_codex_account_card(account))
+        elif provider_name == "copilot":
+            sections.append(_render_copilot_account_card(account))
+        else:
+            sections.append(_render_groq_account_card(account))
+    sections.append("</div></section>")
+    return "".join(sections)
+
+
+def _render_quota_urls_html_tabbed(request: Request, provider_names: list[str]) -> str:
+    """Render the tabbed shell page with lazy-loading JavaScript."""
+    base_url = str(request.url_for("admin_quota_urls"))
+    sections = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'><title>Chat2API Quota Dashboard</title>",
+        f"<style>{_dashboard_styles()}</style>",
+        "<style>",
+        ".tab-bar { display: flex; gap: 6px; margin-bottom: 16px; }",
+        ".tab-btn { appearance: none; border: 1px solid var(--line); background: var(--soft); "
+        "border-radius: 999px; padding: 10px 20px; font: inherit; font-size: 15px; font-weight: 600; "
+        "cursor: pointer; text-transform: capitalize; color: var(--muted); transition: all .15s; }",
+        ".tab-btn:hover { background: rgba(24,34,48,0.08); }",
+        ".tab-btn--active { background: var(--ink); color: white; border-color: var(--ink); }",
+        ".tab-btn--codex.tab-btn--active { background: var(--codex); border-color: var(--codex); }",
+        ".tab-btn--gemini.tab-btn--active { background: var(--gemini); border-color: var(--gemini); }",
+        ".tab-btn--copilot.tab-btn--active { background: var(--copilot); border-color: var(--copilot); }",
+        ".tab-btn--groq.tab-btn--active { background: var(--groq); border-color: var(--groq); }",
+        ".tab-pane { display: none; }",
+        ".tab-pane--active { display: block; }",
+        ".tab-loading { padding: 40px; text-align: center; color: var(--muted); font-size: 15px; }",
+        ".tab-error { padding: 20px; color: var(--bad); background: rgba(180,35,24,0.06); border-radius: 16px; }",
+        ".refresh-btn { appearance: none; border: 1px solid var(--line); background: var(--soft); "
+        "border-radius: 999px; padding: 8px 16px; font: inherit; font-size: 13px; cursor: pointer; "
+        "color: var(--muted); margin-left: auto; }",
+        ".refresh-btn:hover { background: rgba(24,34,48,0.08); }",
+        ".tab-header { display: flex; align-items: center; gap: 10px; }",
+        "</style>",
+        "</head><body>",
+        "<div class='shell'>",
+        "<header class='hero'>",
+        "<div class='hero__eyebrow'>Chat2API Admin</div>",
+        "<h1>Quota Dashboard</h1>",
+        "<p>Click a provider tab to load its quota data. Click Refresh to reload.</p>",
+        "</header>",
+        "<div class='tab-header'>",
+        "<div class='tab-bar'>",
+    ]
+
+    for i, name in enumerate(provider_names):
+        active = " tab-btn--active" if i == 0 else ""
+        sections.append(
+            f"<button class='tab-btn tab-btn--{escape(name)}{active}' "
+            f"data-tab='{escape(name)}' onclick='switchTab(\"{escape(name)}\")'>"
+            f"{escape(_provider_display_name(name))}</button>"
+        )
+
+    sections.append("</div>")
+    sections.append("<button class='refresh-btn' onclick='refreshTab()'>Refresh</button>")
+    sections.append("</div>")
+
+    for i, name in enumerate(provider_names):
+        active = " tab-pane--active" if i == 0 else ""
+        sections.append(f"<div class='tab-pane{active}' id='tab-{escape(name)}'>"
+                        "<div class='tab-loading'>Loading...</div></div>")
+
+    sections.append(f"""
+<script>
+const BASE = {json.dumps(base_url)};
+const cached = {{}};
+const fresh = {{}};
+let activeTab = {json.dumps(provider_names[0] if provider_names else '')};
+
+async function loadTab(name, force) {{
+  if (!force && fresh[name]) return;
+  const pane = document.getElementById('tab-' + name);
+  if (!pane) return;
+
+  // Phase 1: instant cached render (skip if we already have fresh data or are forcing)
+  if (!cached[name] && !force) {{
+    pane.innerHTML = "<div class='tab-loading'>Loading " + name + "...</div>";
+    try {{
+      const cResp = await fetch(BASE + '?provider=' + encodeURIComponent(name) + '&format=html');
+      if (cResp.ok) {{
+        pane.innerHTML = await cResp.text();
+        cached[name] = true;
+      }}
+    }} catch (e) {{}}
+  }}
+
+  // Phase 2: fresh data in background
+  if (force) {{
+    pane.insertAdjacentHTML('beforeend',
+      "<div class='tab-refreshing' style='text-align:center;padding:8px;color:var(--muted);font-size:13px'>Refreshing...</div>");
+  }}
+  try {{
+    const fResp = await fetch(BASE + '?provider=' + encodeURIComponent(name) + '&fresh=1&format=html');
+    if (fResp.ok) {{
+      pane.innerHTML = await fResp.text();
+      fresh[name] = true;
+      cached[name] = true;
+    }}
+  }} catch (err) {{
+    if (!cached[name]) {{
+      pane.innerHTML = "<div class='tab-error'>Failed to load " + name + ": " + err.message + "</div>";
+    }}
+    const r = pane.querySelector('.tab-refreshing');
+    if (r) r.remove();
+  }}
+}}
+
+function switchTab(name) {{
+  activeTab = name;
+  document.querySelectorAll('.tab-btn').forEach(b => {{
+    b.classList.toggle('tab-btn--active', b.dataset.tab === name);
+  }});
+  document.querySelectorAll('.tab-pane').forEach(p => {{
+    p.classList.toggle('tab-pane--active', p.id === 'tab-' + name);
+  }});
+  loadTab(name, false);
+}}
+
+function refreshTab() {{
+  if (activeTab) {{
+    fresh[activeTab] = false;
+    loadTab(activeTab, true);
+  }}
+}}
+
+// Auto-load first tab
+if (activeTab) loadTab(activeTab, false);
+</script>
+""")
+
+    sections.append("</div></body></html>")
+    return "".join(sections)
 
 
 def _render_quota_urls_html(payload: dict[str, Any]) -> str:
@@ -618,11 +1131,13 @@ def _render_quota_urls_html(payload: dict[str, Any]) -> str:
         sections.append(f"<section class='provider {provider_class}'>")
         sections.append("<div class='provider__head'>")
         sections.append(
-            f"<div><div class='provider__label'>{escape(provider_name)}</div>"
+            f"<div><div class='provider__label'>{escape(_provider_display_name(provider_name))}</div>"
             f"<div class='provider__meta'>{escape(_provider_summary(provider_name))}</div></div>"
         )
         sections.append(f"<div class='provider__count'>{len(provider.get('accounts') or [])} account(s)</div>")
         sections.append("</div>")
+        if provider.get("usage_note"):
+            sections.append(f"<div class='provider__note'>{escape(str(provider['usage_note']))}</div>")
 
         accounts = provider.get("accounts") or []
         if not accounts:
@@ -634,8 +1149,12 @@ def _render_quota_urls_html(payload: dict[str, Any]) -> str:
         for account in sorted(accounts, key=_account_sort_key):
             if provider_name == "gemini":
                 sections.append(_render_gemini_account_card(account))
-            else:
+            elif provider_name == "codex":
                 sections.append(_render_codex_account_card(account))
+            elif provider_name == "copilot":
+                sections.append(_render_copilot_account_card(account))
+            else:
+                sections.append(_render_groq_account_card(account))
         sections.append("</div></section>")
 
     sections.append("</div></body></html>")
@@ -653,14 +1172,42 @@ def _provider_summary(provider_name: str) -> str:
         return "Each row shows the shared weekly Codex pool for that account."
     if provider_name == "gemini":
         return "Each row shows the live Gemini quota pools for that account."
+    if provider_name == "copilot":
+        return "Shows GitHub OAuth status, included-model policy, and the shared monthly premium-request pool."
+    if provider_name == "groq":
+        return "Shows Groq API-key wiring from local env/file config plus the routed model set."
     return "Per-account quota overview."
 
 
-def _account_sort_key(account: dict[str, Any]) -> tuple[int, int, int, str]:
+def _account_sort_key(account: dict[str, Any]) -> tuple[int, int, int, float, float, str]:
+    # Extract primary remaining percent for sorting
+    remaining = -1.0  # unknown/error sorts last
+    reset_at = float("inf")
+    quota = account.get("quota") or {}
+    if quota:
+        # Codex: shared weekly quota
+        weekly = quota.get("weekly") or {}
+        rp = weekly.get("remaining_percent")
+        if isinstance(rp, (int, float)):
+            remaining = rp
+        ra = weekly.get("reset_at")
+        if isinstance(ra, (int, float)):
+            reset_at = ra
+    else:
+        # Gemini: use the lowest remaining across groups
+        for group in account.get("groups") or []:
+            gq = group.get("quota") or {}
+            rp = gq.get("remaining_percent")
+            if isinstance(rp, (int, float)):
+                if remaining < 0 or rp < remaining:
+                    remaining = rp
+
     return (
         0 if account.get("is_active") else 1,
         0 if not account.get("quota_error") else 1,
         0 if not account.get("disabled") else 1,
+        -remaining,   # higher quota first (negate for ascending sort)
+        reset_at,     # earlier reset first
         str(account.get("email") or ""),
     )
 
@@ -715,6 +1262,8 @@ def _dashboard_styles() -> str:
       --soft: rgba(24, 34, 48, 0.04);
       --gemini: #0c8f7a;
       --codex: #c55a11;
+      --copilot: #2563eb;
+      --groq: #d9485f;
     }
     * { box-sizing: border-box; }
     body {
@@ -791,6 +1340,8 @@ def _dashboard_styles() -> str:
     }
     .provider--gemini .provider__label { color: var(--gemini); }
     .provider--codex .provider__label { color: var(--codex); }
+    .provider--copilot .provider__label { color: var(--copilot); }
+    .provider--groq .provider__label { color: var(--groq); }
     .account-list {
       display: flex;
       flex-direction: column;
@@ -879,6 +1430,11 @@ def _dashboard_styles() -> str:
       font-size: 22px;
       font-weight: 700;
       line-height: 1;
+    }
+    .quota-brief__value--text {
+      font-size: 18px;
+      line-height: 1.2;
+      word-break: break-word;
     }
     .quota-brief__meta {
       margin-top: 8px;
@@ -1190,14 +1746,91 @@ def _render_codex_account_card(account: dict[str, Any]) -> str:
     return "".join(sections)
 
 
+def _render_copilot_account_card(account: dict[str, Any]) -> str:
+    sections = ["<article class='account-row'>"]
+    sections.append(_render_account_identity(account))
+    if account.get("quota_error"):
+        sections.append(_render_quota_error(str(account["quota_error"])))
+    else:
+        sections.append("<div class='quota-strip'>")
+        sections.append(
+            _render_info_brief(
+                "Included Models",
+                account.get("included_summary"),
+                account.get("included_meta"),
+                tone="good",
+            )
+        )
+        sections.append(
+            _render_info_brief(
+                "Premium Pool",
+                account.get("premium_summary"),
+                account.get("premium_meta"),
+                tone="warn",
+            )
+        )
+        sections.append(
+            _render_info_brief(
+                "Configured Models",
+                _display_model_policy_summary(account),
+                _display_model_policy_meta(account),
+                tone="neutral",
+            )
+        )
+        sections.append("</div>")
+    sections.append(_render_static_account_action(account.get("status_badge") or "GitHub OAuth", tone="solid"))
+    sections.append("</article>")
+    return "".join(sections)
+
+
+def _render_groq_account_card(account: dict[str, Any]) -> str:
+    sections = ["<article class='account-row'>"]
+    sections.append(_render_account_identity(account))
+    if account.get("quota_error"):
+        sections.append(_render_quota_error(str(account["quota_error"])))
+    else:
+        sections.append("<div class='quota-strip'>")
+        sections.append(
+            _render_info_brief(
+                "API Keys",
+                account.get("keys_summary"),
+                account.get("keys_meta"),
+                tone="good",
+            )
+        )
+        sections.append(
+            _render_info_brief(
+                "Config State",
+                account.get("config_summary"),
+                account.get("config_meta"),
+                tone="neutral",
+            )
+        )
+        sections.append(
+            _render_info_brief(
+                "Configured Models",
+                str(len(account.get("models") or [])),
+                ", ".join(model["model_id"] for model in account.get("models") or []) or "No models configured",
+                tone="neutral",
+            )
+        )
+        sections.append("</div>")
+    sections.append(_render_static_account_action(account.get("status_badge") or "API key"))
+    sections.append("</article>")
+    return "".join(sections)
+
+
 def _render_account_identity(account: dict[str, Any]) -> str:
     quota_url = account.get("quota_url")
-    title = escape(account["email"])
+    title = escape(str(account.get("display_name") or account["email"]))
     if quota_url and not account.get("quota_error"):
         title_html = f"<a href=\"{escape(quota_url)}\">{title}</a>"
     else:
         title_html = title
-    meta = "Quota unavailable" if account.get("quota_error") else ""
+    meta_items = [str(item) for item in account.get("meta_items") or [] if item]
+    if account.get("quota_error"):
+        meta_items.append("Quota unavailable")
+    meta = " · ".join(meta_items)
     meta_html = f"<div class='account-row__meta'>{escape(meta)}</div>" if meta else ""
     return (
         "<div class='account-row__identity'>"
@@ -1229,6 +1862,11 @@ def _render_account_action(account: dict[str, Any], *, provider: str) -> str:
     )
 
 
+def _render_static_account_action(label: str, *, tone: str = "solid") -> str:
+    class_name = "chip chip--solid" if tone == "solid" else "chip"
+    return f"<div class='account-row__action'><div class='{class_name}'>{escape(label)}</div></div>"
+
+
 def _render_quota_brief(label: str, quota: dict[str, Any], *, href: str | None = None) -> str:
     wrapper_tag = "a" if href else "div"
     wrapper_attrs = (
@@ -1248,6 +1886,24 @@ def _render_quota_brief(label: str, quota: dict[str, Any], *, href: str | None =
         "</div>"
         f"<div class='quota-brief__meta'>Resets in {escape(reset_in)}<br><span class='mono'>{escape(reset_time)}</span></div>"
         f"</{wrapper_tag}>"
+    )
+
+
+def _render_info_brief(label: str, value: Any, meta: Any, *, tone: str = "neutral") -> str:
+    tone_class = {
+        "good": "tone-good",
+        "warn": "tone-warn",
+        "bad": "tone-bad",
+    }.get(tone, "tone-neutral")
+    meta_text = escape(str(meta)) if meta is not None else "N/A"
+    return (
+        "<div class='quota-brief'>"
+        "<div class='quota-brief__head'>"
+        f"<div class='quota-brief__label'>{escape(label)}</div>"
+        f"<div class='quota-brief__value quota-brief__value--text {tone_class}'>{escape(_display_value(value))}</div>"
+        "</div>"
+        f"<div class='quota-brief__meta'>{meta_text}</div>"
+        "</div>"
     )
 
 
@@ -1272,6 +1928,27 @@ def _compact_group_label(label: str) -> str:
     if value.endswith(" pool"):
         value = value[:-5]
     return value
+
+
+def _display_model_policy_summary(account: dict[str, Any]) -> str:
+    included = len(account.get("included_models") or [])
+    premium = len(account.get("premium_models") or [])
+    unknown = len(account.get("unknown_models") or [])
+    parts = [f"{included} included", f"{premium} premium"]
+    if unknown:
+        parts.append(f"{unknown} unknown")
+    return " / ".join(parts)
+
+
+def _display_model_policy_meta(account: dict[str, Any]) -> str:
+    chunks = []
+    if account.get("included_models"):
+        chunks.append("Included: " + ", ".join(account["included_models"]))
+    if account.get("premium_models"):
+        chunks.append("Premium: " + ", ".join(account["premium_models"]))
+    if account.get("unknown_models"):
+        chunks.append("Unknown-docs: " + ", ".join(account["unknown_models"]))
+    return " | ".join(chunks) or "No configured models"
 
 
 def _compact_reset_time(value: Any) -> str:

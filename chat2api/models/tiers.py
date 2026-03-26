@@ -29,11 +29,11 @@ class UnknownModelError(ValueError):
             return (
                 f"Unknown model '{self.model}'. "
                 f"Did you mean '{self.suggestions[0]}'? "
-                f"Use 'gemini' or 'codex' for the best available model."
+                f"Available: 'gemini', 'codex', 'copilot', 'groq', 'smart', 'fast', 'code'."
             )
         return (
             f"Unknown model '{self.model}'. "
-            f"Use 'gemini' or 'codex' for the best available model."
+            f"Available: 'gemini', 'codex', 'copilot', 'groq', 'smart', 'fast', 'code'."
         )
 
 

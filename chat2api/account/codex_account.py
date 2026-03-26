@@ -293,13 +293,47 @@ def refresh_tokens(refresh_token: str) -> dict[str, Any]:
         raise CodexAuthError(f"Codex token refresh failed: {exc.reason}") from exc
 
 
+def _try_recover_from_auth_json(account: CodexAccount) -> CodexAccount | None:
+    """Check if auth.json has fresher tokens for this account (e.g. after CLI re-login)."""
+    if not AUTH_PATH.exists():
+        return None
+    try:
+        auth_data = _read_json(AUTH_PATH)
+        tokens = auth_data.get("tokens") or {}
+        access_token = tokens.get("access_token", "")
+        if not access_token:
+            return None
+        info = extract_account_info(tokens.get("id_token"), access_token)
+        if info.email != account.email:
+            return None
+        if is_token_expired(access_token):
+            return None
+        account.access_token = access_token
+        account.refresh_token = tokens.get("refresh_token") or account.refresh_token
+        account.id_token = tokens.get("id_token") or account.id_token
+        account.account_id = info.account_id or account.account_id
+        account.plan_type = info.plan_type or account.plan_type
+        account.last_used = int(time.time())
+        save_account(account)
+        return account
+    except Exception:
+        return None
+
+
 def ensure_fresh_account(account: CodexAccount, force: bool = False) -> CodexAccount:
     if not account.access_token or not account.refresh_token:
         raise CodexAuthError(f"Codex account {account.email} is missing OAuth tokens")
     if not force and not is_token_expired(account.access_token):
         return account
 
-    refreshed = refresh_tokens(account.refresh_token)
+    try:
+        refreshed = refresh_tokens(account.refresh_token)
+    except CodexAuthError:
+        recovered = _try_recover_from_auth_json(account)
+        if recovered is not None:
+            return recovered
+        raise
+
     account.access_token = refreshed.get("access_token") or account.access_token
     account.refresh_token = refreshed.get("refresh_token") or account.refresh_token
     account.id_token = refreshed.get("id_token") or account.id_token

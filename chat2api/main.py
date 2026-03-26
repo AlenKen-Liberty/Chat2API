@@ -8,14 +8,20 @@ from chat2api.config import get_settings
 from chat2api.routing.admin import router as admin_router
 from chat2api.routing.completions import router as completions_router
 from chat2api.routing.models import router as models_router
+from chat2api.usage_logger import init_usage_log
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+
     app = FastAPI(
         title="Chat2API",
-        description="OpenAI-compatible bridge for Gemini CLI and Codex account pools",
+        description="OpenAI-compatible LLM pool: Gemini, Codex, Copilot, Groq and more",
         version=__version__,
     )
+
+    # Initialize usage logging
+    init_usage_log("logs/usage.jsonl")
 
     app.add_middleware(
         CORSMiddleware,
@@ -37,7 +43,7 @@ def create_app() -> FastAPI:
             "status": "running",
             "host": settings.server.host,
             "port": settings.server.port,
-            "providers": ["gemini", "codex"],
+            "providers": list(settings.providers.keys()),
         }
 
     @app.get("/health")

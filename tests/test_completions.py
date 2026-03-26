@@ -22,6 +22,23 @@ class RateLimitBackend(ProviderBackend):
         raise ProviderRateLimitError("Rate limited")
 
 
+class RecordingBackend(ProviderBackend):
+    provider_name = "recording"
+
+    def __init__(self):
+        self.calls = []
+
+    def stream_text(self, target, request):
+        self.calls.append(
+            {
+                "provider": target.provider,
+                "model_id": target.model_id,
+                "requested_model": request.model,
+            }
+        )
+        yield "OK"
+
+
 def test_chat_completions_success():
     async def scenario():
         async with make_client() as client:
@@ -123,5 +140,41 @@ def test_unknown_model_error():
                 json={"model": "unknown-model-xyz-123", "messages": [{"role": "user", "content": "hi"}]},
             )
             assert response.status_code == 400
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("requested_model", "expected_provider", "expected_model_id"),
+    [
+        ("copilot", "copilot", "gpt-4o"),
+        ("copilot-claude", "copilot", "claude-sonnet-4.5"),
+        ("groq", "groq", "llama-3.3-70b-versatile"),
+    ],
+)
+def test_chat_completions_routes_copilot_and_groq_models(requested_model, expected_provider, expected_model_id):
+    async def scenario():
+        backend = RecordingBackend()
+        async with make_client() as client:
+            with patch("chat2api.routing.completions.get_backend_registry") as mock_reg:
+                mock_registry = MagicMock()
+                mock_registry.get.return_value = backend
+                mock_reg.return_value = mock_registry
+
+                response = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": requested_model, "messages": [{"role": "user", "content": "hi"}]},
+                )
+
+                assert response.status_code == 200
+                assert response.json()["model"] == expected_model_id
+                assert backend.calls == [
+                    {
+                        "provider": expected_provider,
+                        "model_id": expected_model_id,
+                        "requested_model": requested_model,
+                    }
+                ]
+                mock_registry.get.assert_called_once_with(expected_provider)
 
     asyncio.run(scenario())

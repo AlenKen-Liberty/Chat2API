@@ -1,4 +1,9 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from chat2api.routing.admin import _group_gemini_models, _render_account_action
+from tests.http_client import make_client
 
 
 def test_group_gemini_models_uses_live_quota_bucket_signature():
@@ -75,3 +80,87 @@ def test_render_account_action_uses_distinct_state_styles():
     assert "Active account" in active_html
     assert "chip--action" in inactive_html
     assert "Become active account" in inactive_html
+
+
+def test_admin_dashboard_lists_copilot_and_groq_tabs():
+    async def scenario():
+        async with make_client() as client:
+            response = await client.get("/admin/quota-urls", headers={"accept": "text/html"})
+            assert response.status_code == 200
+            assert "GitHub Copilot" in response.text
+            assert ">Groq<" in response.text
+
+    asyncio.run(scenario())
+
+
+def test_admin_copilot_tab_shows_oauth_and_premium_limits():
+    async def scenario():
+        account = SimpleNamespace(
+            username="octocat",
+            email="octocat",
+            plan_name="Copilot Pro",
+            sku="copilot_for_individuals",
+            api_base="https://api.individual.githubcopilot.com",
+            auth_mode="GitHub OAuth",
+            premium_requests_per_month=300,
+            premium_usage={"usage_percent": 2.7, "used": 8, "limit": 300, "reset_date": None},
+        )
+        async with make_client() as client:
+            with patch("chat2api.routing.admin.ensure_fresh_copilot_account", return_value=account), patch(
+                "chat2api.routing.admin.get_active_copilot_account_email", return_value="octocat"
+            ):
+                response = await client.get("/admin/quota-urls?provider=copilot&format=html")
+                assert response.status_code == 200
+                assert "GitHub OAuth" in response.text
+                assert "2.7%" in response.text
+                assert "8 / 300 premium requests used" in response.text
+                assert "gpt-4o" in response.text
+                assert "claude-opus-4.5 (3x)" in response.text
+
+    asyncio.run(scenario())
+
+
+def test_admin_copilot_tab_falls_back_to_entitlement_when_no_usage():
+    """When premium_usage is None (API unavailable), show N/month."""
+    async def scenario():
+        account = SimpleNamespace(
+            username="octocat",
+            email="octocat",
+            plan_name="Copilot Pro",
+            sku="copilot_for_individuals",
+            api_base="https://api.individual.githubcopilot.com",
+            auth_mode="GitHub OAuth",
+            premium_requests_per_month=300,
+            premium_usage=None,
+        )
+        async with make_client() as client:
+            with patch("chat2api.routing.admin.ensure_fresh_copilot_account", return_value=account), patch(
+                "chat2api.routing.admin.get_active_copilot_account_email", return_value="octocat"
+            ):
+                response = await client.get("/admin/quota-urls?provider=copilot&format=html")
+                assert response.status_code == 200
+                assert "300/month" in response.text
+
+    asyncio.run(scenario())
+
+
+def test_admin_groq_tab_shows_env_backed_key_status():
+    async def scenario():
+        async with make_client() as client:
+            with patch(
+                "chat2api.routing.admin.describe_api_keys",
+                return_value={
+                    "provider": "groq",
+                    "configured": True,
+                    "key_count": 1,
+                    "sources": ["GROQ_API_KEY"],
+                    "masked_keys": ["gsk_...1234"],
+                },
+            ):
+                response = await client.get("/admin/quota-urls?provider=groq&format=html")
+                assert response.status_code == 200
+                assert "Groq API keys" in response.text
+                assert "GROQ_API_KEY" in response.text
+                assert "llama-3.3-70b-versatile" in response.text
+
+    asyncio.run(scenario())
