@@ -1211,7 +1211,18 @@ def _render_quota_urls_html(payload: dict[str, Any]) -> str:
                 sections.append(_render_copilot_account_card(account))
             else:
                 sections.append(_render_groq_account_card(account))
-        sections.append("</div></section>")
+        sections.append("</div>")
+
+        # Provider-level model list with aliases (shown once, not per-account)
+        all_models = _configured_models().get(provider_name, [])
+        if all_models:
+            tone = provider_name if provider_name in ("gemini", "codex", "copilot", "groq") else "neutral"
+            sections.append("<div class='model-section'>")
+            sections.append("<div class='model-section__label'>Available Models &amp; Aliases</div>")
+            sections.append(_render_model_list_with_aliases(all_models, tone=tone))
+            sections.append("</div>")
+
+        sections.append("</section>")
 
     sections.append("</div></body></html>")
     return "".join(sections)
