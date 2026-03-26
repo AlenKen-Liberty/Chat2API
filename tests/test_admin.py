@@ -95,18 +95,24 @@ def test_admin_dashboard_lists_copilot_and_groq_tabs():
 
 def test_admin_copilot_tab_shows_oauth_and_premium_limits():
     async def scenario():
+        import time
         account = SimpleNamespace(
             username="octocat",
             email="octocat",
             plan_name="Copilot Pro",
             sku="copilot_for_individuals",
             api_base="https://api.individual.githubcopilot.com",
+            _api_base="https://api.individual.githubcopilot.com",
             auth_mode="GitHub OAuth",
             premium_requests_per_month=300,
             premium_usage={"usage_percent": 2.7, "used": 8, "limit": 300, "reset_date": None},
+            _premium_usage={"usage_percent": 2.7, "used": 8, "limit": 300, "reset_date": None},
+            _session_expires_at=time.time() + 3000,
         )
         async with make_client() as client:
-            with patch("chat2api.routing.admin.ensure_fresh_copilot_account", return_value=account), patch(
+            with patch("chat2api.routing.admin.get_copilot_account", return_value=account), patch(
+                "chat2api.routing.admin.ensure_fresh_copilot_account", return_value=account
+            ), patch(
                 "chat2api.routing.admin.get_active_copilot_account_email", return_value="octocat"
             ):
                 response = await client.get("/admin/quota-urls?provider=copilot&format=html")
@@ -123,18 +129,24 @@ def test_admin_copilot_tab_shows_oauth_and_premium_limits():
 def test_admin_copilot_tab_falls_back_to_entitlement_when_no_usage():
     """When premium_usage is None (API unavailable), show N/month."""
     async def scenario():
+        import time
         account = SimpleNamespace(
             username="octocat",
             email="octocat",
             plan_name="Copilot Pro",
             sku="copilot_for_individuals",
             api_base="https://api.individual.githubcopilot.com",
+            _api_base="https://api.individual.githubcopilot.com",
             auth_mode="GitHub OAuth",
             premium_requests_per_month=300,
             premium_usage=None,
+            _premium_usage=None,
+            _session_expires_at=time.time() + 3000,
         )
         async with make_client() as client:
-            with patch("chat2api.routing.admin.ensure_fresh_copilot_account", return_value=account), patch(
+            with patch("chat2api.routing.admin.get_copilot_account", return_value=account), patch(
+                "chat2api.routing.admin.ensure_fresh_copilot_account", return_value=account
+            ), patch(
                 "chat2api.routing.admin.get_active_copilot_account_email", return_value="octocat"
             ):
                 response = await client.get("/admin/quota-urls?provider=copilot&format=html")

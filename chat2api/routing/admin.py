@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from chat2api.account.copilot_account import (
     CopilotAuthError,
     PREMIUM_REQUEST_RESET_NOTE as COPILOT_PREMIUM_RESET_NOTE,
+    get_copilot_account,
     ensure_fresh_account as ensure_fresh_copilot_account,
     get_active_account_email as get_active_copilot_account_email,
 )
@@ -282,7 +283,8 @@ def _build_single_provider_entry(
             ],
         }
     if provider_name == "copilot":
-        return _build_copilot_provider_entry(request, models.get("copilot", []))
+        builder = _build_copilot_provider_entry_cached if use_cache else _build_copilot_provider_entry
+        return builder(request, models.get("copilot", []))
     if provider_name == "groq":
         return _build_groq_provider_entry(request, models.get("groq", []))
     return None
@@ -319,6 +321,41 @@ def _load_copilot_dashboard_account() -> dict[str, Any]:
     }
 
 
+def _load_copilot_dashboard_account_cached() -> dict[str, Any]:
+    try:
+        # get_copilot_account() will lazy load the long-lived token but won't trigger session API 
+        # unless session_token is accessed
+        account = get_copilot_account()
+        # If no session has been fetched yet, usage is empty
+        usage = account._premium_usage
+        
+        return {
+            "configured": True,
+            "display_name": account.username or "GitHub Copilot",
+            "email": account.email,
+            "plan_name": account.plan_name,
+            "sku": account.sku,
+            "api_base": account._api_base,  # direct property access to avoid network
+            "auth_mode": account.auth_mode,
+            "premium_requests_per_month": account.premium_requests_per_month,
+            "premium_usage": usage,
+            "quota_error": None if account._session_expires_at > 0 else "No cached session (click Refresh)",
+        }
+    except CopilotAuthError as exc:
+        return {
+            "configured": False,
+            "display_name": "GitHub Copilot OAuth",
+            "email": "github-copilot",
+            "plan_name": "Plan unavailable",
+            "sku": None,
+            "api_base": None,
+            "auth_mode": "GitHub OAuth",
+            "premium_requests_per_month": None,
+            "premium_usage": None,
+            "quota_error": str(exc),
+        }
+
+
 def _copilot_model_policy(model_id: str) -> dict[str, Any]:
     multiplier = COPILOT_PREMIUM_MODEL_MULTIPLIERS.get(model_id)
     if multiplier is None:
@@ -343,8 +380,10 @@ def _copilot_model_policy(model_id: str) -> dict[str, Any]:
     }
 
 
-def _build_copilot_provider_entry(request: Request, provider_models: list[dict[str, Any]]) -> dict[str, Any]:
-    account = _load_copilot_dashboard_account()
+def _build_copilot_provider_entry(
+    request: Request, provider_models: list[dict[str, Any]], *, cached: bool = False
+) -> dict[str, Any]:
+    account = _load_copilot_dashboard_account_cached() if cached else _load_copilot_dashboard_account()
     active_email = get_active_copilot_account_email()
 
     model_entries = []
@@ -427,6 +466,12 @@ def _build_copilot_provider_entry(request: Request, provider_models: list[dict[s
             }
         ],
     }
+
+
+def _build_copilot_provider_entry_cached(request: Request, provider_models: list[dict[str, Any]]) -> dict[str, Any]:
+    entry = _build_copilot_provider_entry(request, provider_models, cached=True)
+    entry["accounts"][0]["cached"] = True
+    return entry
 
 
 def _build_groq_provider_entry(request: Request, provider_models: list[dict[str, Any]]) -> dict[str, Any]:

@@ -44,6 +44,7 @@ class CopilotAccount:
     # Short-lived copilot session token (refreshed automatically)
     _session_token: str = field(default="", repr=False)
     _session_expires_at: int = 0
+    _premium_usage: dict[str, Any] | None = field(default=None, repr=False)
     _api_base: str = "https://api.githubcopilot.com"
     _lock: Lock = field(default_factory=Lock, repr=False)
 
@@ -65,12 +66,9 @@ class CopilotAccount:
 
     @property
     def premium_usage(self) -> dict[str, Any] | None:
-        """Fetch live premium-request usage from GitHub API.
-
-        Returns dict with keys: usage_percent, used, limit, reset_date
-        or None if unavailable.
-        """
-        return fetch_copilot_premium_usage(self.github_token)
+        """Return cached live premium-request usage."""
+        _ = self.session_token  # Ensure session (and usage) is fetched
+        return self._premium_usage
 
     @property
     def session_token(self) -> str:
@@ -105,6 +103,7 @@ class CopilotAccount:
 
         self._session_token = data["token"]
         self._session_expires_at = int(data.get("expires_at", time.time() + 1500))
+        self._premium_usage = _parse_premium_usage(data)
         endpoints = data.get("endpoints", {})
         self._api_base = endpoints.get("api", "https://api.githubcopilot.com")
         self.sku = data.get("sku", self.sku)
@@ -206,24 +205,11 @@ def get_active_account_email() -> str | None:
         return None
 
 
-def fetch_copilot_premium_usage(github_token: str) -> dict[str, Any] | None:
-    """Fetch premium request usage from GitHub's Copilot internal token endpoint.
+def _parse_premium_usage(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract premium usage from GitHub's internal token endpoint response.
 
-    Tries GET https://api.github.com/copilot_internal/v2/token to retrieve premium usage.
-    Returns a dict with: usage_percent, limit, reset_date, used — or None if unavailable/unlimited.
+    Returns a dict with: usage_percent, limit, reset_date, used — or None.
     """
-    req = urllib.request.Request(COPILOT_TOKEN_URL)
-    req.add_header("Authorization", f"token {github_token}")
-    req.add_header("User-Agent", "Chat2API/1.0")
-    req.add_header("Accept", "application/json")
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-    except Exception as exc:
-        logger.debug("Copilot token fetch for usage failed: %s", exc)
-        return None
-
     if not isinstance(data, dict):
         return None
 
